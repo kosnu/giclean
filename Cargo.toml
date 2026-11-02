@@ -1,0 +1,15 @@
+[package]
+name = "giclean"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "A command-line tool for Git cleanup"
+readme = "README.md"
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+strip = true
+lto = "thin"
