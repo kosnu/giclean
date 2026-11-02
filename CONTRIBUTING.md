@@ -44,4 +44,23 @@ GitHub Actions は push / pull request で同じ検証とリリースビルド�
 
 公開・配布ライセンスは未設定で、`Cargo.toml` は `publish = false` にしています。
 
+バージョンは `Cargo.toml` の `package.version` を正本とし、対応する `vX.Y.Z` タグと GitHub Releases で管理します。初回は `v0.1.0` です。通常の修正は patch、機能追加は minor、互換性を壊す変更は major を更新します。`Cargo.lock` と `giclean --version` も同じバージョンに揃えます。`--version` はビルド時に `Cargo.toml` から埋め込まれます。
+
+リリース手順:
+
+1. `Cargo.toml` のバージョンを更新し、`cargo check` で `Cargo.lock` を同期します。初回は既存の `0.1.0` を使います。
+2. `make check` と `make build` を実行し、変更を `main` に反映します。
+3. リリース対象の `main` のコミットに注釈付きタグを作り、そのタグだけを push します。初回の例:
+
+   ```sh
+   git tag -a v0.1.0 -m "giclean v0.1.0"
+   git push origin v0.1.0
+   ```
+
+4. GitHub Actions の `Release` が成功したことと、[GitHub Releases](https://github.com/kosnu/giclean/releases) の公開内容を確認します。
+
+`Release` はタグと `Cargo.toml` の一致を確認し、macOS / Linux の x86_64 / aarch64 それぞれで `make check` と `make build` を実行します。すべて成功した場合に、バージョン・ターゲット名付きの `.tar.gz`、`SHA256SUMS`、自動生成したリリースノートを公開します。Linux 版は Ubuntu 24.04 上でビルドするため、配布先には glibc 2.39 以降が必要です。
+
+`0.2.0-rc.1` のようなバージョンと `v0.2.0-rc.1` タグは GitHub の prerelease として公開します。一度公開したタグは移動・再利用せず、修正は新しいバージョンでリリースします。crates.io への公開は行いません。
+
 利用開始に必要な情報は [README](README.md)、コマンドの仕様と制約は [br の仕様](docs/commands/br.md)、設計判断や SSH 接続の説明は [設計](docs/design.md)に記載します。
