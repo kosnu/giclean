@@ -4,7 +4,13 @@ Git のお掃除コマンドです。
 
 ## インストール
 
-Rust 1.89.0 / Git 2.47 以降が必要です。macOS / Linux 対応。
+macOS / Linux 対応。実行には Git 2.47 以降が必要です。
+
+[GitHub Releases](https://github.com/kosnu/giclean/releases) から OS・CPU に合う `.tar.gz` をダウンロードし、展開した `giclean` を PATH の通ったディレクトリに配置します。macOS / Linux ともに x86_64 / aarch64（ARM64）向けを配布します。Linux 版は glibc 2.39 以降が必要です。
+
+同じリリースの `SHA256SUMS` でファイルの整合性を確認できます。バージョンは `giclean --version` で確認します。
+
+ソースからインストールする場合は Rust 1.89.0 も必要です。
 
 ```sh
 cargo install --path . --locked
