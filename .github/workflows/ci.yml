@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install toolchain
+        run: rustup toolchain install 1.89.0 --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        run: cargo +1.89.0 fmt --all -- --check
+      - name: Lint
+        run: cargo +1.89.0 clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo +1.89.0 test --locked --all-targets
+      - name: Build release binary
+        run: cargo +1.89.0 build --locked --release
