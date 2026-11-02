@@ -28,6 +28,7 @@ fn isolated(command: &mut Command) -> &mut Command {
         "GIT_TEMPLATE_DIR",
         "GIT_SSH",
         "GIT_SSH_COMMAND",
+        "GIT_SSH_VARIANT",
     ] {
         command.env_remove(key);
     }
@@ -543,6 +544,169 @@ mod unix {
             .arg("br")
             .env("PATH", std::env::join_paths(paths).unwrap());
         command
+    }
+
+    // The SSH boundary is simulated; the advertised refs come from a real local
+    // upload-pack process, without network access or user SSH configuration.
+    fn ssh_transport(repo: &Repo) -> Command {
+        repo.git(&["branch", "merged"]);
+        repo.git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "git@example.invalid:repo.git",
+        ]);
+        let output = checked(Command::new("sh").args(["-c", "command -v git"]));
+        let real_git = PathBuf::from(text(&output.stdout));
+        let bin = repo.root.join("ssh-bin");
+        fs::create_dir(&bin).unwrap();
+        let path = bin.join("ssh");
+        fs::write(&path, format!(
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$1\" >> {}\nif [ \"$1\" = -V ]; then\nprintf '%s\\n' \"${{TEST_SSH_VERSION:-OpenSSH_9.9p2}}\" >&2\nexit 0\nfi\nif [ \"$1\" = -G ]; then\nexit 0\nfi\nprintf '%s\\n' \"$@\" > {}\nexec {} upload-pack {}\n",
+            shell_quote(&repo.root.join("ssh-calls")),
+            shell_quote(&repo.root.join("ssh-args")),
+            shell_quote(&real_git),
+            shell_quote(&repo.origin),
+        )).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let mut command = repo.cli();
+        command
+            .args(["br", "--dry-run"])
+            .env("PATH", std::env::join_paths(paths).unwrap());
+        command
+    }
+
+    #[test]
+    fn openssh_queries_use_the_same_private_control_path_across_invocations() {
+        let repo = Repo::new();
+        let mut command = ssh_transport(&repo);
+        let output = checked(&mut command);
+        assert_eq!(text(&output.stdout), "candidate: merged");
+        let first = fs::read_to_string(repo.root.join("ssh-args")).unwrap();
+        assert!(first.lines().any(|arg| arg == "ControlMaster=auto"));
+        assert!(first.lines().any(|arg| arg == "ControlPersist=60"));
+        assert!(first.lines().any(|arg| arg.starts_with("ControlPath=/tmp/giclean-ssh-") && arg.ends_with("-%C")));
+        let output = checked(&mut command);
+        assert_eq!(text(&output.stdout), "candidate: merged");
+        assert_eq!(
+            fs::read_to_string(repo.root.join("ssh-args")).unwrap(),
+            first
+        );
+        assert!(repo.exists("merged"));
+    }
+
+    #[test]
+    fn reused_ssh_transport_still_reads_the_latest_remote_head() {
+        let repo = Repo::new();
+        let mut command = ssh_transport(&repo);
+        let first = checked(&mut command);
+        assert_eq!(text(&first.stdout), "candidate: merged");
+        let control = fs::read_to_string(repo.root.join("ssh-args")).unwrap();
+
+        let other = repo.root.join("other");
+        checked(
+            repo.git_command()
+                .arg("clone")
+                .arg(&repo.origin)
+                .arg(&other),
+        );
+        checked(repo.git_command().current_dir(&other).args([
+            "commit",
+            "--allow-empty",
+            "-m",
+            "new remote commit",
+        ]));
+        checked(
+            repo.git_command()
+                .current_dir(&other)
+                .args(["push", "origin", "main"]),
+        );
+
+        let second = command.output().unwrap();
+        assert_eq!(second.status.code(), Some(1));
+        assert!(second.stdout.is_empty());
+        assert!(text(&second.stderr).contains("git fetch origin"));
+        assert_eq!(
+            fs::read_to_string(repo.root.join("ssh-args")).unwrap(),
+            control
+        );
+        assert!(repo.exists("merged"));
+        assert!(!repo.work.join(".git/FETCH_HEAD").exists());
+    }
+
+    #[test]
+    fn explicit_ssh_commands_and_variants_are_preserved() {
+        for setting in [
+            "GIT_SSH_COMMAND",
+            "GIT_SSH",
+            "GIT_SSH_VARIANT",
+            "core.sshCommand",
+            "ssh.variant",
+        ] {
+            let repo = Repo::new();
+            let mut command = ssh_transport(&repo);
+            match setting {
+                "GIT_SSH_COMMAND" => {
+                    command.env(setting, "ssh -o IdentityFile=/test/user-key");
+                }
+                "GIT_SSH" => {
+                    command.env(setting, repo.root.join("ssh-bin/ssh"));
+                }
+                "GIT_SSH_VARIANT" => {
+                    command.env(setting, "simple");
+                }
+                "core.sshCommand" => {
+                    repo.git(&["config", setting, "ssh -o IdentityFile=/test/user-key"]);
+                }
+                "ssh.variant" => {
+                    repo.git(&["config", setting, "simple"]);
+                }
+                _ => unreachable!(),
+            }
+            let output = checked(&mut command);
+            assert_eq!(text(&output.stdout), "candidate: merged", "{setting}");
+            let args = fs::read_to_string(repo.root.join("ssh-args")).unwrap();
+            assert!(!args.contains("ControlMaster"), "{setting}: {args}");
+            if matches!(setting, "GIT_SSH_COMMAND" | "core.sshCommand") {
+                assert!(args.contains("IdentityFile=/test/user-key"), "{setting}");
+            }
+            assert!(
+                !fs::read_to_string(repo.root.join("ssh-calls"))
+                    .unwrap()
+                    .lines()
+                    .any(|arg| arg == "-V"),
+                "{setting}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_ssh_implementations_keep_the_native_transport() {
+        let repo = Repo::new();
+        let mut command = ssh_transport(&repo);
+        command.env("TEST_SSH_VERSION", "Dropbear ssh");
+        let output = checked(&mut command);
+        assert_eq!(text(&output.stdout), "candidate: merged");
+        let args = fs::read_to_string(repo.root.join("ssh-args")).unwrap();
+        assert!(!args.contains("ControlMaster"));
+    }
+
+    #[test]
+    fn local_remotes_do_not_probe_or_launch_ssh() {
+        let repo = Repo::new();
+        let mut command = ssh_transport(&repo);
+        checked(
+            repo.git_command()
+                .args(["remote", "set-url", "origin"])
+                .arg(&repo.origin),
+        );
+        let output = checked(&mut command);
+        assert_eq!(text(&output.stdout), "candidate: merged");
+        assert!(!repo.root.join("ssh-calls").exists());
     }
 
     #[test]

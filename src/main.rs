@@ -4,6 +4,8 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::process::{Command, ExitCode, Stdio};
 
+mod ssh;
+
 const HELP: &str = "giclean — Git のお掃除コマンド
 
 使い方: giclean <command> [options]
@@ -127,13 +129,17 @@ fn git(args: &[&str]) -> Command {
 }
 
 fn git_text(args: &[&str]) -> Result<String, String> {
-    let output = git(args)
+    git_command_text(git(args), args[0])
+}
+
+fn git_command_text(mut command: Command, operation: &str) -> Result<String, String> {
+    let output = command
         .output()
-        .map_err(|e| format!("git {} を実行できません: {e}", args[0]))?;
+        .map_err(|e| format!("git {operation} を実行できません: {e}"))?;
     if !output.status.success() {
         return Err(format!(
-            "git {} が失敗しました ({})。",
-            args[0], output.status
+            "git {operation} が失敗しました ({})。",
+            output.status
         ));
     }
     String::from_utf8(output.stdout)
@@ -227,15 +233,11 @@ fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<(), String> {
     }
 
     // Require a configured remote, rather than accidentally treating "origin" as a path.
-    git_text(&["remote", "get-url", "origin"])?;
+    let origin = git_text(&["remote", "get-url", "origin"])?;
     eprintln!("giclean: origin の既定ブランチと最新コミットを確認しています...");
-    let remote = parse_remote_head(&git_text(&[
-        "ls-remote",
-        "--symref",
-        "--exit-code",
-        "origin",
-        "HEAD",
-    ])?)?;
+    let mut query = git(&["ls-remote", "--symref", "--exit-code", "origin", "HEAD"]);
+    ssh::configure(&mut query, origin.trim());
+    let remote = parse_remote_head(&git_command_text(query, "ls-remote")?)?;
     git_text(&["check-ref-format", &format!("refs/heads/{}", remote.branch)])?;
     let commit = git(&["cat-file", "-t", &remote.oid])
         .stderr(Stdio::null())
