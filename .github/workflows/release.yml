@@ -19,7 +19,7 @@ jobs:
     outputs:
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v6.1.0
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - name: Check tag matches package version
@@ -61,7 +61,7 @@ jobs:
       CARGO_BUILD_TARGET: ${{ matrix.target }}
       RELEASE_TAG: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v6.1.0
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - name: Install toolchain
