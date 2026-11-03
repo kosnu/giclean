@@ -1,4 +1,4 @@
-.PHONY: check fmt build
+.PHONY: check fmt build install
 
 check:
 	cargo fmt --all -- --check
@@ -10,3 +10,6 @@ fmt:
 
 build:
 	cargo build --locked --release
+
+install:
+	cargo install --path . --locked
