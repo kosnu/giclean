@@ -17,7 +17,7 @@ make check  # フォーマット・Clippy・テスト
 make build  # target/release/giclean を生成
 ```
 
-PATH 上で利用する場合は、`cargo install --path . --locked` で Cargo の bin ディレクトリにインストールします。通常は `~/.cargo/bin` です。
+PATH 上で利用する場合は、`make install` で Cargo の bin ディレクトリにインストールします。通常は `~/.cargo/bin` です。内部では `cargo install --path . --locked` を実行します。
 
 ## 検証
 

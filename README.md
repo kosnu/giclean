@@ -13,7 +13,7 @@ macOS / Linux 対応。実行には Git 2.47 以降が必要です。
 ソースからインストールする場合は Rust 1.89.0 も必要です。
 
 ```sh
-cargo install --path . --locked
+make install
 ```
 
 ## 更新
@@ -23,10 +23,10 @@ cargo install --path . --locked
 ソースからインストールした場合は、ソースを更新したうえで、そのディレクトリで再インストールします。
 
 ```sh
-cargo install --path . --locked
+make install
 ```
 
-`--path` を指定すると毎回ビルド・インストールするため、通常は `--force` は不要です。
+`make install` は `cargo install --path . --locked` を実行します。毎回ビルド・インストールするため、通常は `--force` は不要です。
 
 更新後はバージョンを確認します。
 
