@@ -4,7 +4,10 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::process::{Command, ExitCode, Stdio};
 
+mod progress;
 mod ssh;
+
+use progress::Progress;
 
 const HELP: &str = "giclean — Git のお掃除コマンド
 
@@ -128,13 +131,17 @@ fn git(args: &[&str]) -> Command {
     command
 }
 
-fn git_text(args: &[&str]) -> Result<String, String> {
-    git_command_text(git(args), args[0])
+fn git_text(args: &[&str], progress: &Progress) -> Result<String, String> {
+    git_command_text(git(args), args[0], progress)
 }
 
-fn git_command_text(mut command: Command, operation: &str) -> Result<String, String> {
-    let output = command
-        .output()
+fn git_command_text(
+    mut command: Command,
+    operation: &str,
+    progress: &Progress,
+) -> Result<String, String> {
+    let output = progress
+        .output(&mut command)
         .map_err(|e| format!("git {operation} を実行できません: {e}"))?;
     if !output.status.success() {
         return Err(format!(
@@ -149,6 +156,7 @@ fn git_command_text(mut command: Command, operation: &str) -> Result<String, Str
 fn branch_snapshot(
     merged_into: Option<&str>,
     name: Option<&str>,
+    progress: &Progress,
 ) -> Result<BTreeMap<String, Branch>, String> {
     let mut args = vec!["for-each-ref", "--sort=refname", BRANCH_FORMAT];
     let merged_arg;
@@ -158,7 +166,7 @@ fn branch_snapshot(
     }
     let reference = name.map_or_else(|| "refs/heads/".to_owned(), |n| format!("refs/heads/{n}"));
     args.push(&reference);
-    let output = git_text(&args)?;
+    let output = git_text(&args, progress)?;
     let mut branches = BTreeMap::new();
     for line in output.lines() {
         let fields: Vec<_> = line.split('\t').collect();
@@ -216,14 +224,18 @@ fn parse_remote_head(output: &str) -> Result<RemoteHead, String> {
 }
 
 fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<(), String> {
-    eprintln!("giclean: ローカルブランチを確認しています...");
-    if git_text(&["rev-parse", "--is-inside-work-tree"])?.trim() != "true" {
+    let progress = Progress::start(
+        "ローカルブランチを確認中…",
+        Some("ローカルブランチを確認しています..."),
+    );
+    if git_text(&["rev-parse", "--is-inside-work-tree"], &progress)?.trim() != "true" {
         return Err("作業ツリーのある Git リポジトリ内で実行してください。".into());
     }
-    let initial: BTreeMap<_, _> = branch_snapshot(None, None)?
+    let initial: BTreeMap<_, _> = branch_snapshot(None, None, &progress)?
         .into_iter()
         .filter(|(_, branch)| !branch.protected())
         .collect();
+    progress.finish("ローカルブランチを確認", None);
     if initial.is_empty() {
         eprintln!("giclean: 対象ブランチはありません。");
         if !dry_run {
@@ -233,12 +245,18 @@ fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<(), String> {
     }
 
     // Require a configured remote, rather than accidentally treating "origin" as a path.
-    let origin = git_text(&["remote", "get-url", "origin"])?;
-    eprintln!("giclean: origin の既定ブランチと最新コミットを確認しています...");
+    let progress = Progress::start(
+        "origin の既定ブランチと最新コミットを確認中…",
+        Some("origin の既定ブランチと最新コミットを確認しています..."),
+    );
+    let origin = git_text(&["remote", "get-url", "origin"], &progress)?;
     let mut query = git(&["ls-remote", "--symref", "--exit-code", "origin", "HEAD"]);
     ssh::configure(&mut query, origin.trim());
-    let remote = parse_remote_head(&git_command_text(query, "ls-remote")?)?;
-    git_text(&["check-ref-format", &format!("refs/heads/{}", remote.branch)])?;
+    let remote = parse_remote_head(&git_command_text(query, "ls-remote", &progress)?)?;
+    git_text(
+        &["check-ref-format", &format!("refs/heads/{}", remote.branch)],
+        &progress,
+    )?;
     let commit = git(&["cat-file", "-t", &remote.oid])
         .stderr(Stdio::null())
         .output()
@@ -249,10 +267,24 @@ fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<(), String> {
             remote.branch, remote.oid
         ));
     }
+    progress.finish("origin の既定ブランチと最新コミットを確認", None);
 
-    eprintln!("giclean: マージ済みブランチを判定しています...");
-    let merged = branch_snapshot(Some(&remote.oid), None)?;
+    let progress = Progress::start(
+        "マージ済みブランチを判定中…",
+        Some("マージ済みブランチを判定しています..."),
+    );
+    let merged = branch_snapshot(Some(&remote.oid), None, &progress)?;
+    progress.finish("マージ済みブランチを判定", None);
+    let progress = Progress::start(
+        if dry_run {
+            "削除候補を確認中…"
+        } else {
+            "ブランチを削除中… 0件"
+        },
+        None,
+    );
     let mut deleted = 0;
+    let mut candidates = 0;
     let mut failures = 0;
     for (name, branch) in merged {
         if branch.protected()
@@ -263,10 +295,11 @@ fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<(), String> {
         }
         // Recheck each branch immediately before acting, including changes made after
         // the remote query. Git also refuses to delete branches checked out in worktrees.
-        let latest = match branch_snapshot(None, Some(&name)) {
+        let latest = match branch_snapshot(None, Some(&name), &progress) {
             Ok(latest) => latest,
             Err(error) => {
                 if !dry_run {
+                    progress.suspend();
                     writeln!(out, "deleted: {deleted}").map_err(|e| e.to_string())?;
                 }
                 return Err(error);
@@ -279,24 +312,41 @@ fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<(), String> {
             continue;
         }
         if dry_run {
+            progress.suspend();
             writeln!(out, "candidate: {name}").map_err(|e| e.to_string())?;
+            candidates += 1;
         } else {
-            match git(&["branch", "-D", "--quiet", "--", &name]).status() {
-                Ok(status) if status.success() => deleted += 1,
+            match progress.status(&mut git(&["branch", "-D", "--quiet", "--", &name])) {
+                Ok(status) if status.success() => {
+                    deleted += 1;
+                    progress.update(format!("ブランチを削除中… {deleted}件"));
+                }
                 Ok(status) => {
                     failures += 1;
+                    progress.suspend();
                     eprintln!("giclean: {name} の削除に失敗しました ({status})。");
                 }
                 Err(error) => {
                     failures += 1;
+                    progress.suspend();
                     eprintln!("giclean: {name} を削除できません: {error}");
                 }
             }
         }
     }
-    if dry_run {
-        eprintln!("giclean: 確認が完了しました。");
+    if failures == 0 {
+        progress.finish(
+            &if dry_run {
+                format!("削除候補 {candidates}件の確認が完了")
+            } else {
+                format!("{deleted}件のブランチを削除しました")
+            },
+            dry_run.then_some("確認が完了しました。"),
+        );
     } else {
+        drop(progress);
+    }
+    if !dry_run {
         writeln!(out, "deleted: {deleted}").map_err(|e| e.to_string())?;
     }
     if failures == 0 {
