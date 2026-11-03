@@ -186,6 +186,8 @@ fn dry_run_preserves_squash_unmerged_current_protected_and_used_branches() {
     assert!(progress.starts_with("giclean: ローカルブランチを確認しています..."));
     assert!(progress.contains("origin の既定ブランチと最新コミットを確認しています..."));
     assert!(progress.ends_with("giclean: 確認が完了しました。"));
+    assert!(!progress.contains('\x1b'));
+    assert!(!progress.contains('\r'));
     assert!(!repo.work.join(".git/FETCH_HEAD").exists());
 }
 
@@ -516,6 +518,198 @@ mod unix {
 
     fn shell_quote(path: &Path) -> String {
         format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
+    }
+
+    // Both supported CI systems provide script. Its PTY exercises is_terminal
+    // and live output without adding a terminal library to the application.
+    fn terminal_command(command: &Command) -> Command {
+        let mut terminal = Command::new("script");
+        if cfg!(target_os = "macos") {
+            terminal
+                .args(["-q", "/dev/null"])
+                .arg(command.get_program());
+            terminal.args(command.get_args());
+        } else {
+            let mut args = vec![shell_quote(Path::new(command.get_program()))];
+            args.extend(command.get_args().map(|arg| shell_quote(Path::new(arg))));
+            terminal.args(["-q", "-e", "-c", &args.join(" "), "/dev/null"]);
+        }
+        if let Some(directory) = command.get_current_dir() {
+            terminal.current_dir(directory);
+        }
+        terminal.env("TERM", "xterm");
+        for (key, value) in command.get_envs() {
+            if let Some(value) = value {
+                terminal.env(key, value);
+            } else {
+                terminal.env_remove(key);
+            }
+        }
+        terminal
+    }
+
+    fn in_terminal(command: &Command) -> Output {
+        terminal_command(command)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn terminal_progress_preserves_direct_tty_authentication_prompts() {
+        use std::io::{Read, Write};
+        use std::process::Stdio;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let repo = Repo::new();
+        repo.git(&["branch", "merged"]);
+        let request = repo.root.join("credential-request");
+        fs::write(&request, "protocol=https\nhost=example.invalid\n\n").unwrap();
+        let hook = format!(
+            "if [ \"$1\" = ls-remote ]; then\n\"$real_git\" -c credential.helper= credential fill < {} > /dev/null\nfi",
+            shell_quote(&request),
+        );
+        let mut command = shim(&repo, &hook);
+        command
+            .arg("--dry-run")
+            .env("GIT_TERMINAL_PROMPT", "1")
+            .env_remove("GIT_ASKPASS")
+            .env_remove("SSH_ASKPASS");
+        let mut child = terminal_command(&command)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = child.stdout.take().unwrap();
+        let (send, receive) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut buffer = [0; 4096];
+            while let Ok(size) = output.read(&mut buffer) {
+                if size == 0 || send.send(buffer[..size].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut transcript = Vec::new();
+        let mut redraws_during_input = Vec::new();
+        for (prompt, reply) in [
+            ("Username for ", "repro-user\n"),
+            ("Password for ", "repro-password\n"),
+        ] {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !String::from_utf8_lossy(&transcript).contains(prompt) {
+                let next = receive.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+                match next {
+                    Ok(bytes) => transcript.extend(bytes),
+                    Err(error) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!(
+                            "{prompt} was not shown: {error}; {}",
+                            String::from_utf8_lossy(&transcript)
+                        );
+                    }
+                }
+            }
+            // Keep the real Git prompt open long enough for multiple redraws.
+            let start = transcript.len();
+            let deadline = Instant::now() + Duration::from_millis(350);
+            while let Ok(bytes) =
+                receive.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                transcript.extend(bytes);
+            }
+            redraws_during_input.push(transcript[start..].contains(&b'\x1b'));
+            input.write_all(reply.as_bytes()).unwrap();
+            input.flush().unwrap();
+        }
+        let status = child.wait().unwrap();
+        drop(input);
+        reader.join().unwrap();
+        for bytes in receive.try_iter() {
+            transcript.extend(bytes);
+        }
+        let display = String::from_utf8_lossy(&transcript);
+        assert!(status.success(), "{display}");
+        assert_eq!(redraws_during_input, [false, false], "{display}");
+        assert!(display.contains("candidate: merged"), "{display}");
+        assert!(repo.exists("merged"));
+        assert!(!repo.work.join(".git/FETCH_HEAD").exists());
+    }
+
+    #[test]
+    fn terminal_progress_pauses_during_remote_wait_and_completes_dry_run() {
+        let repo = Repo::new();
+        repo.git(&["branch", "merged"]);
+        let mut command = shim(&repo, "if [ \"$1\" = ls-remote ]; then sleep 0.4; fi");
+        command.arg("--dry-run");
+        let output = in_terminal(&command);
+        assert_success(&output);
+        let display = text(&output.stdout);
+        assert!(display.contains("\r\x1b[2K⠋"), "{display}");
+        let remote_wait = display
+            .split_once("… origin の既定ブランチと最新コミットを確認中…")
+            .unwrap()
+            .1
+            .split_once("✔ origin の既定ブランチと最新コミットを確認")
+            .unwrap()
+            .0;
+        assert!(!remote_wait.contains('⠙'), "{display}");
+        assert!(!remote_wait.contains('⠹'), "{display}");
+        assert!(display.contains("秒"), "{display}");
+        assert!(display.contains("✔ origin の既定ブランチと最新コミットを確認"));
+        assert!(display.contains("candidate: merged"));
+        assert!(display.contains("✔ 削除候補 1件の確認が完了"));
+        assert!(repo.exists("merged"));
+        assert!(!repo.work.join(".git/FETCH_HEAD").exists());
+    }
+
+    #[test]
+    fn terminal_progress_reports_the_actual_deletion_count() {
+        let repo = Repo::new();
+        repo.git(&["branch", "merged"]);
+        let command = shim(&repo, "if [ \"$1\" = branch ]; then sleep 0.2; fi");
+        let output = in_terminal(&command);
+        assert_success(&output);
+        let display = text(&output.stdout);
+        assert!(display.contains("⠙"), "{display}");
+        assert!(display.contains("✔ 1件のブランチを削除しました"));
+        assert!(display.contains("deleted: 1"));
+        assert!(!repo.exists("merged"));
+        assert!(repo.exists("main"));
+    }
+
+    #[test]
+    fn terminal_progress_stops_for_child_diagnostics_and_marks_the_failed_stage() {
+        let repo = Repo::new();
+        repo.git(&["branch", "merged"]);
+        let command = shim(
+            &repo,
+            "if [ \"$1\" = ls-remote ]; then printf 'remote diagnostic' >&2; sleep 0.3; exit 23; fi",
+        );
+        let output = in_terminal(&command);
+        let display = text(&output.stdout);
+        let after_diagnostic = display.split_once("remote diagnostic").unwrap().1;
+        assert!(after_diagnostic.starts_with("\r\n\r\x1b[2K✘"), "{display}");
+        assert!(after_diagnostic.contains("git ls-remote が失敗しました"));
+        assert!(!display.contains("✔ origin の既定ブランチと最新コミットを確認"));
+        assert!(repo.exists("merged"));
+    }
+
+    #[test]
+    fn dumb_terminals_use_plain_progress() {
+        let repo = Repo::new();
+        repo.git(&["branch", "merged"]);
+        let mut command = repo.cli();
+        command.args(["br", "--dry-run"]).env("TERM", "dumb");
+        let output = in_terminal(&command);
+        assert_success(&output);
+        let display = text(&output.stdout);
+        assert!(!display.contains('\x1b'));
+        assert!(display.contains("giclean: ローカルブランチを確認しています..."));
+        assert!(display.contains("candidate: merged"));
     }
 
     // Intercept only the child Git process. Every underlying Git operation is real,
