@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::process::{Command, ExitCode, Output, Stdio};
 
+mod bulk;
 mod git;
 mod progress;
 mod ssh;
@@ -70,6 +71,9 @@ struct RemoteHead {
 }
 
 fn main() -> ExitCode {
+    if let Some(status) = bulk::hook() {
+        return status;
+    }
     let action = match parse_args(env::args_os().skip(1)) {
         Ok(action) => action,
         Err(error) => {
@@ -455,6 +459,30 @@ fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<ExitCode, Strin
     });
     let mut results = Vec::new();
     let mut failed = false;
+    let candidates: BTreeMap<_, _> = merged
+        .iter()
+        .filter(|(name, branch)| {
+            !branch.protected()
+                && *name != &remote.branch
+                && initial.get(*name).is_some_and(|old| old.oid == branch.oid)
+        })
+        .map(|(name, branch)| (name.clone(), branch.clone()))
+        .collect();
+    let batch_failure = if dry_run {
+        None
+    } else {
+        match bulk::delete(&candidates, &progress)? {
+            bulk::Outcome::Deleted => {
+                progress.finish();
+                for name in candidates.keys() {
+                    writeln!(out, "{name}: deleted").map_err(|e| e.to_string())?;
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+            bulk::Outcome::Retry(output) => Some(output),
+            bulk::Outcome::Individual => None,
+        }
+    };
     for (name, branch) in merged {
         if branch.protected()
             || name == remote.branch
@@ -476,6 +504,18 @@ fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<ExitCode, Strin
                 return Err(error);
             }
         };
+        // A failed batch may have removed refs before branch-config cleanup
+        // failed. Preserve those failure rows instead of silently losing them.
+        if !latest.contains_key(&name) {
+            if let Some(output) = &batch_failure {
+                failed = true;
+                results.push(format!(
+                    "{name}: failed ({})",
+                    deletion_reason(&name, output)
+                ));
+            }
+            continue;
+        }
         if latest
             .get(&name)
             .is_none_or(|current| current.protected() || current.oid != branch.oid)
