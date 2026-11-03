@@ -2,40 +2,40 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, Write};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Command, ExitCode, Output, Stdio};
 
 mod progress;
 mod ssh;
 
 use progress::Progress;
 
-const HELP: &str = "giclean — Git のお掃除コマンド
+const HELP: &str = "giclean — Git cleanup
 
-使い方: giclean <command> [options]
+Usage: giclean <command> [options]
 
-コマンド:
-  br             マージ済みのローカルブランチを削除
+Commands:
+  br             Delete merged local branches
 
-オプション:
-  -h, --help     ヘルプを表示
-  -V, --version  バージョンを表示
+Options:
+  -h, --help     Show help
+  -V, --version  Show version
 
-各コマンドの使い方は giclean <command> --help で確認できます。
+Run giclean <command> --help for command usage.
 ";
 
-const BRANCHES_HELP: &str = "giclean br — マージ済みのローカルブランチを削除
+const BRANCHES_HELP: &str = "giclean br — Delete merged local branches
 
-使い方: giclean br [--dry-run]
+Usage: giclean br [--dry-run]
 
-origin の最新の既定ブランチにマージ済みのローカルブランチを削除します。
-squash は変更した全パスの内容・権限が一致する場合に対象とします。
+Delete local branches merged into origin's latest default branch.
+Includes squash merges when all changed paths match in content and permissions.
 
-オプション:
-  --dry-run   削除候補だけを表示
-  -h, --help  ヘルプを表示
+Options:
+  --dry-run   Show deletion candidates only
+  -h, --help  Show help
 
-通常実行は確認なしで削除します。まず --dry-run で確認してください。
-自動 fetch は行いません。GitHub CLI は不要です。
+Deletes without confirmation. Use --dry-run to preview.
+Does not fetch automatically. GitHub CLI is not required.
 ";
 
 const BRANCH_FORMAT: &str = "--format=%(refname)%09%(objectname)%09%(HEAD)%09%(if)%(worktreepath)%(then)used%(else)free%(end)%09%(symref)";
@@ -72,7 +72,7 @@ fn main() -> ExitCode {
     let action = match parse_args(env::args_os().skip(1)) {
         Ok(action) => action,
         Err(error) => {
-            eprintln!("giclean: {error}\n使い方: giclean <command> [options]");
+            eprintln!("giclean: {error}\nUsage: giclean <command> [options]");
             return ExitCode::from(2);
         }
     };
@@ -80,15 +80,19 @@ fn main() -> ExitCode {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let result = match action {
-        Action::Help => write!(out, "{HELP}").map_err(|e| e.to_string()),
-        Action::BranchesHelp => write!(out, "{BRANCHES_HELP}").map_err(|e| e.to_string()),
-        Action::Version => {
-            writeln!(out, "giclean {}", env!("CARGO_PKG_VERSION")).map_err(|e| e.to_string())
-        }
+        Action::Help => write!(out, "{HELP}")
+            .map(|()| ExitCode::SUCCESS)
+            .map_err(|e| e.to_string()),
+        Action::BranchesHelp => write!(out, "{BRANCHES_HELP}")
+            .map(|()| ExitCode::SUCCESS)
+            .map_err(|e| e.to_string()),
+        Action::Version => writeln!(out, "giclean {}", env!("CARGO_PKG_VERSION"))
+            .map(|()| ExitCode::SUCCESS)
+            .map_err(|e| e.to_string()),
         Action::Branches { dry_run } => clean_branches(dry_run, &mut out),
     };
-    match result.and_then(|()| out.flush().map_err(|e| e.to_string())) {
-        Ok(()) => ExitCode::SUCCESS,
+    match result.and_then(|status| out.flush().map(|()| status).map_err(|e| e.to_string())) {
+        Ok(status) => status,
         Err(error) => {
             eprintln!("giclean: {error}");
             ExitCode::FAILURE
@@ -110,7 +114,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Action, String> {
             Ok(Action::BranchesHelp)
         }
         _ => Err(format!(
-            "不正な引数: {}",
+            "invalid arguments: {}",
             args.iter()
                 .map(|arg| arg.to_string_lossy())
                 .collect::<Vec<_>>()
@@ -128,6 +132,7 @@ fn git(args: &[&str]) -> Command {
         .args(args)
         // Ancestry must reflect the real commits, not local replacement objects.
         .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("LC_ALL", "C")
         .stderr(Stdio::inherit());
     command
 }
@@ -143,15 +148,11 @@ fn git_command_text(
 ) -> Result<String, String> {
     let output = progress
         .output(&mut command)
-        .map_err(|e| format!("git {operation} を実行できません: {e}"))?;
+        .map_err(|e| format!("could not run git {operation}: {e}"))?;
     if !output.status.success() {
-        return Err(format!(
-            "git {operation} が失敗しました ({})。",
-            output.status
-        ));
+        return Err(format!("git {operation} failed ({})", output.status));
     }
-    String::from_utf8(output.stdout)
-        .map_err(|_| "Git の出力に UTF-8 以外の文字が含まれるため停止しました。".into())
+    String::from_utf8(output.stdout).map_err(|_| "Git output is not valid UTF-8".into())
 }
 
 type TreeChanges = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -181,14 +182,11 @@ fn tree_changes(
     ]);
     let output = progress
         .output_with_input(&mut command, input.as_bytes())
-        .map_err(|e| format!("git diff-tree を実行できません: {e}"))?;
+        .map_err(|e| format!("could not run git diff-tree: {e}"))?;
     if !output.status.success() {
-        return Err(format!(
-            "git diff-tree が失敗しました ({})。",
-            output.status
-        ));
+        return Err(format!("git diff-tree failed ({})", output.status));
     }
-    let error = "ツリーの変更を解釈できないため停止しました。";
+    let error = "cannot parse tree changes";
     let mut remaining = output.stdout.as_slice();
     let mut results = BTreeMap::new();
     for pair in pairs {
@@ -220,7 +218,7 @@ fn squash_included(
     // Bound argv size and the number of tree diffs retained at once. All reuse is
     // scoped to this run and immutable object IDs, never branch names or refs.
     const BATCH_SIZE: usize = 128;
-    let error = "共通祖先を解釈できないため停止しました。";
+    let error = "cannot parse merge bases";
     let mut bases = BTreeMap::new();
     for chunk in tips.chunks(BATCH_SIZE) {
         // A...B expands to B, A, and every merge-base prefixed by ^. Git performs
@@ -266,7 +264,7 @@ fn squash_included(
         let output = git_command_text(command, "rev-parse", progress)?;
         let ids: Vec<_> = output.lines().collect();
         if ids.len() != chunk.len() || ids.iter().any(|oid| !valid_oid(oid)) {
-            return Err("ツリーの ID を解釈できないため停止しました。".into());
+            return Err("cannot parse tree IDs".into());
         }
         trees.extend(
             chunk
@@ -333,7 +331,7 @@ fn branch_snapshot(
             || !matches!(fields[2], "*" | " ")
             || !matches!(fields[3], "used" | "free")
         {
-            return Err("ローカルブランチの状態を解釈できないため停止しました。".into());
+            return Err("cannot parse local branch state".into());
         }
         let branch = Branch {
             name: fields[0]["refs/heads/".len()..].to_owned(),
@@ -357,55 +355,48 @@ fn parse_remote_head(output: &str) -> Result<RemoteHead, String> {
     let mut oid = None;
     for line in output.lines() {
         let Some((value, reference)) = line.split_once('\t') else {
-            return Err("origin の参照情報を解釈できないため停止しました。".into());
+            return Err("cannot parse origin refs".into());
         };
         if reference != "HEAD" {
             continue;
         }
         if let Some(name) = value.strip_prefix("ref: refs/heads/") {
             if name.is_empty() || branch.replace(name.to_owned()).is_some() {
-                return Err("origin の既定ブランチを一意に取得できません。".into());
+                return Err("cannot determine a unique default branch for origin".into());
             }
         } else if valid_oid(value) {
             if oid.replace(value.to_owned()).is_some() {
-                return Err("origin の最新コミットを一意に取得できません。".into());
+                return Err("cannot determine a unique latest commit for origin".into());
             }
         } else {
-            return Err("origin の HEAD が通常のブランチを指していません。".into());
+            return Err("origin HEAD does not point to a branch".into());
         }
     }
     match (branch, oid) {
         (Some(branch), Some(oid)) => Ok(RemoteHead { branch, oid }),
-        _ => Err("origin の既定ブランチと最新コミットを取得できません。リモートの HEAD を確認してください。".into()),
+        _ => Err(
+            "cannot determine origin's default branch and latest commit; check the remote HEAD"
+                .into(),
+        ),
     }
 }
 
-fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<(), String> {
-    let progress = Progress::start(
-        "ローカルブランチを確認中…",
-        Some("ローカルブランチを確認しています..."),
-    );
+fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<ExitCode, String> {
+    let progress = Progress::start("Checking local branches...");
     if git_text(&["rev-parse", "--is-inside-work-tree"], &progress)?.trim() != "true" {
-        return Err("作業ツリーのある Git リポジトリ内で実行してください。".into());
+        return Err("run this command inside a Git working tree".into());
     }
     let initial: BTreeMap<_, _> = branch_snapshot(None, None, &progress)?
         .into_iter()
         .filter(|(_, branch)| !branch.protected())
         .collect();
-    progress.finish("ローカルブランチを確認", None);
     if initial.is_empty() {
-        eprintln!("giclean: 対象ブランチはありません。");
-        if !dry_run {
-            writeln!(out, "deleted: 0").map_err(|e| e.to_string())?;
-        }
-        return Ok(());
+        progress.finish();
+        return Ok(ExitCode::SUCCESS);
     }
 
     // Require a configured remote, rather than accidentally treating "origin" as a path.
-    let progress = Progress::start(
-        "origin の既定ブランチと最新コミットを確認中…",
-        Some("origin の既定ブランチと最新コミットを確認しています..."),
-    );
+    progress.update("Checking origin's default branch and latest commit...");
     let origin = git_text(&["remote", "get-url", "origin"], &progress)?;
     progress.pause_for_input();
     let mut query = git(&["ls-remote", "--symref", "--exit-code", "origin", "HEAD"]);
@@ -418,19 +409,14 @@ fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<(), String> {
     let commit = git(&["cat-file", "-t", &remote.oid])
         .stderr(Stdio::null())
         .output()
-        .map_err(|e| format!("基準コミットを確認できません: {e}"))?;
+        .map_err(|e| format!("could not check the target commit: {e}"))?;
     if !commit.status.success() || commit.stdout != b"commit\n" {
         return Err(format!(
-            "origin/{} の最新コミット ({}) がローカルにありません。git fetch origin を実行してから再実行してください。",
+            "the latest commit of origin/{} ({}) is not available locally; run git fetch origin and retry",
             remote.branch, remote.oid
         ));
     }
-    progress.finish("origin の既定ブランチと最新コミットを確認", None);
-
-    let progress = Progress::start(
-        "マージ済みブランチを判定中…",
-        Some("マージ済みブランチを判定しています..."),
-    );
+    progress.update("Checking merged branches...");
     let mut merged = branch_snapshot(Some(&remote.oid), None, &progress)?;
     let tips: BTreeSet<_> = initial
         .iter()
@@ -447,18 +433,13 @@ fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<(), String> {
             merged.insert(name.clone(), branch.clone());
         }
     }
-    progress.finish("マージ済みブランチを判定", None);
-    let progress = Progress::start(
-        if dry_run {
-            "削除候補を確認中…"
-        } else {
-            "ブランチを削除中… 0件"
-        },
-        None,
-    );
-    let mut deleted = 0;
-    let mut candidates = 0;
-    let mut failures = 0;
+    progress.update(if dry_run {
+        "Checking deletion candidates..."
+    } else {
+        "Deleting branches..."
+    });
+    let mut results = Vec::new();
+    let mut failed = false;
     for (name, branch) in merged {
         if branch.protected()
             || name == remote.branch
@@ -473,7 +454,9 @@ fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<(), String> {
             Err(error) => {
                 if !dry_run {
                     progress.suspend();
-                    writeln!(out, "deleted: {deleted}").map_err(|e| e.to_string())?;
+                    for result in &results {
+                        writeln!(out, "{result}").map_err(|e| e.to_string())?;
+                    }
                 }
                 return Err(error);
             }
@@ -487,46 +470,61 @@ fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<(), String> {
         if dry_run {
             progress.suspend();
             writeln!(out, "candidate: {name}").map_err(|e| e.to_string())?;
-            candidates += 1;
         } else {
-            match progress.status(&mut git(&["branch", "-D", "--quiet", "--", &name])) {
-                Ok(status) if status.success() => {
-                    deleted += 1;
-                    progress.update(format!("ブランチを削除中… {deleted}件"));
+            // Capture diagnostics for the result row instead of interrupting the spinner.
+            // Git's English diagnostics also keep failure reasons independent of locale.
+            let deletion = git(&["branch", "-D", "--quiet", "--", &name])
+                .stderr(Stdio::piped())
+                .output();
+            match deletion {
+                Ok(output) if output.status.success() => {
+                    results.push(format!("{name}: deleted"));
                 }
-                Ok(status) => {
-                    failures += 1;
-                    progress.suspend();
-                    eprintln!("giclean: {name} の削除に失敗しました ({status})。");
+                Ok(output) => {
+                    failed = true;
+                    results.push(format!(
+                        "{name}: failed ({})",
+                        deletion_reason(&name, &output)
+                    ));
                 }
                 Err(error) => {
-                    failures += 1;
-                    progress.suspend();
-                    eprintln!("giclean: {name} を削除できません: {error}");
+                    failed = true;
+                    results.push(format!("{name}: failed (could not run git: {error})"));
                 }
             }
         }
     }
-    if failures == 0 {
-        progress.finish(
-            &if dry_run {
-                format!("削除候補 {candidates}件の確認が完了")
-            } else {
-                format!("{deleted}件のブランチを削除しました")
-            },
-            dry_run.then_some("確認が完了しました。"),
-        );
+    progress.finish();
+    for result in &results {
+        writeln!(out, "{result}").map_err(|e| e.to_string())?;
+    }
+    Ok(if failed {
+        ExitCode::FAILURE
     } else {
-        drop(progress);
+        ExitCode::SUCCESS
+    })
+}
+
+fn deletion_reason(name: &str, output: &Output) -> String {
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    let diagnostics = diagnostics.trim();
+    if diagnostics.lines().count() == 1
+        && (diagnostics.starts_with(&format!(
+            "error: cannot delete branch '{name}' used by worktree at '"
+        )) || diagnostics.starts_with(&format!(
+            "error: Cannot delete branch '{name}' checked out at '"
+        )))
+    {
+        return "checked out in a worktree".into();
     }
-    if !dry_run {
-        writeln!(out, "deleted: {deleted}").map_err(|e| e.to_string())?;
+    if diagnostics.is_empty() {
+        return format!("git branch failed with {}", output.status);
     }
-    if failures == 0 {
-        Ok(())
-    } else {
-        Err(format!("{failures} 件のブランチを削除できませんでした。"))
-    }
+    diagnostics
+        .lines()
+        .map(|line| line.trim().strip_prefix("error: ").unwrap_or(line.trim()))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 #[cfg(test)]

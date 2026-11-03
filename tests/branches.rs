@@ -199,12 +199,7 @@ fn dry_run_includes_squash_and_preserves_unmerged_current_protected_and_used_bra
     assert_success(&output);
     assert_eq!(text(&output.stdout), "candidate: merged\ncandidate: squash");
     assert_eq!(repo.git(&["show-ref"]), before);
-    let progress = text(&output.stderr);
-    assert!(progress.starts_with("giclean: ローカルブランチを確認しています..."));
-    assert!(progress.contains("origin の既定ブランチと最新コミットを確認しています..."));
-    assert!(progress.ends_with("giclean: 確認が完了しました。"));
-    assert!(!progress.contains('\x1b'));
-    assert!(!progress.contains('\r'));
+    assert!(output.stderr.is_empty());
     assert!(!repo.work.join(".git/FETCH_HEAD").exists());
 }
 
@@ -245,7 +240,7 @@ fn squash_deletion_matches_complete_changes_with_other_default_branch_changes() 
 
         let output = repo.cli().arg("br").current_dir(subdir).output().unwrap();
         assert_success(&output);
-        assert_eq!(text(&output.stdout), "deleted: 1", "{format}");
+        assert_eq!(text(&output.stdout), "squash: deleted", "{format}");
         assert!(!repo.exists("squash"));
         assert_eq!(
             fs::read(repo.work.join("edited")).unwrap(),
@@ -298,7 +293,7 @@ fn squash_preserves_partial_reverted_later_edited_and_extra_tip_changes() {
         repo.git(&["push", "origin", "main"]);
         let output = repo.run(&["br"]);
         assert_success(&output);
-        assert_eq!(text(&output.stdout), "deleted: 0", "{case}");
+        assert_eq!(text(&output.stdout), "", "{case}");
         assert!(repo.exists("squash"));
     }
 }
@@ -311,7 +306,7 @@ fn unrelated_histories_are_preserved() {
     repo.git(&["switch", "main"]);
     let output = repo.run(&["br"]);
     assert_success(&output);
-    assert_eq!(text(&output.stdout), "deleted: 0");
+    assert_eq!(text(&output.stdout), "");
     assert!(repo.exists("unrelated"));
 }
 
@@ -347,7 +342,7 @@ fn multiple_merge_bases_are_preserved_in_a_batch_with_an_eligible_branch() {
     repo.git(&["push", "origin", "main"]);
     let output = repo.run(&["br"]);
     assert_success(&output);
-    assert_eq!(text(&output.stdout), "deleted: 1");
+    assert_eq!(text(&output.stdout), "squash: deleted");
     assert!(repo.exists("ambiguous"));
     assert!(!repo.exists("squash"));
 }
@@ -364,7 +359,10 @@ fn deletion_cleans_branch_configuration_and_preserves_other_refs() {
 
     let output = repo.run(&["br"]);
     assert_success(&output);
-    assert_eq!(text(&output.stdout), "deleted: 2");
+    assert_eq!(
+        text(&output.stdout),
+        "merged: deleted\n日本語/マージ済み: deleted"
+    );
     assert!(!repo.exists("merged"));
     assert!(!repo.exists("日本語/マージ済み"));
     assert!(repo.exists("unmerged"));
@@ -389,7 +387,7 @@ fn protected_or_used_branches_need_no_remote() {
     repo.git(&["remote", "remove", "origin"]);
     let output = repo.run(&["br"]);
     assert_success(&output);
-    assert_eq!(text(&output.stdout), "deleted: 0");
+    assert_eq!(text(&output.stdout), "");
     assert!(!text(&output.stderr).contains("origin"));
     let output = repo.run(&["br", "--dry-run"]);
     assert_success(&output);
@@ -407,7 +405,7 @@ fn unborn_repository_needs_no_remote() {
     );
     let output = repo.cli().arg("br").current_dir(&unborn).output().unwrap();
     assert_success(&output);
-    assert_eq!(text(&output.stdout), "deleted: 0");
+    assert_eq!(text(&output.stdout), "");
 }
 
 #[test]
@@ -478,7 +476,7 @@ fn uses_remote_head_instead_of_a_stale_remote_tracking_branch() {
     repo.git(&["switch", "main"]);
     let output = repo.run(&["br"]);
     assert_success(&output);
-    assert_eq!(text(&output.stdout), "deleted: 0");
+    assert_eq!(text(&output.stdout), "");
     assert!(repo.exists("only-local"));
 }
 
@@ -496,7 +494,7 @@ fn protects_a_custom_default_branch_even_with_detached_head() {
     repo.git(&["switch", "--detach"]);
     let output = repo.run(&["br"]);
     assert_success(&output);
-    assert_eq!(text(&output.stdout), "deleted: 1");
+    assert_eq!(text(&output.stdout), "merged: deleted");
     assert!(repo.exists("trunk"));
     assert!(repo.exists("main"));
     assert!(!repo.exists("merged"));
@@ -516,7 +514,7 @@ fn detached_remote_head_is_rejected() {
     let output = repo.run(&["br"]);
     assert_eq!(output.status.code(), Some(1));
     assert!(repo.exists("merged"));
-    assert!(text(&output.stderr).contains("リモートの HEAD"));
+    assert!(text(&output.stderr).contains("remote HEAD"));
 }
 
 #[test]
@@ -546,7 +544,7 @@ fn can_run_from_a_linked_worktree_and_protects_both_checkouts() {
         .output()
         .unwrap();
     assert_success(&output);
-    assert_eq!(text(&output.stdout), "deleted: 1");
+    assert_eq!(text(&output.stdout), "merged: deleted");
     assert!(repo.exists("used"));
     assert!(repo.exists("main"));
     assert!(!repo.exists("merged"));
@@ -558,7 +556,7 @@ fn symbolic_local_branches_are_preserved() {
     repo.git(&["symbolic-ref", "refs/heads/alias", "refs/heads/main"]);
     let output = repo.run(&["br"]);
     assert_success(&output);
-    assert_eq!(text(&output.stdout), "deleted: 0");
+    assert_eq!(text(&output.stdout), "");
     assert!(repo.exists("alias"));
     assert!(repo.exists("main"));
 }
@@ -574,7 +572,7 @@ fn replacement_objects_do_not_make_unmerged_commits_eligible() {
     repo.git(&["replace", &tip, &base]);
     let output = repo.run(&["br"]);
     assert_success(&output);
-    assert_eq!(text(&output.stdout), "deleted: 0");
+    assert_eq!(text(&output.stdout), "");
     assert!(repo.exists("unmerged"));
 }
 
@@ -584,7 +582,7 @@ fn supports_sha256_repositories() {
     repo.git(&["branch", "merged"]);
     let output = repo.run(&["br"]);
     assert_success(&output);
-    assert_eq!(text(&output.stdout), "deleted: 1");
+    assert_eq!(text(&output.stdout), "merged: deleted");
     assert!(!repo.exists("merged"));
 }
 
@@ -612,8 +610,8 @@ fn root_shows_cleanup_help_without_deleting_branches() {
     let output = repo.run(&[]);
     assert_success(&output);
     let help = text(&output.stdout);
-    assert!(help.starts_with("giclean — Git のお掃除コマンド"));
-    assert!(help.contains("使い方: giclean <command> [options]"));
+    assert!(help.starts_with("giclean — Git cleanup"));
+    assert!(help.contains("Usage: giclean <command> [options]"));
     assert!(help.contains("  br "));
     assert!(output.stderr.is_empty());
     assert_eq!(repo.git(&["show-ref"]), before);
@@ -634,7 +632,7 @@ fn invalid_arguments_return_two_before_running_git() {
     ] {
         let output = repo.cli().args(&args).env("PATH", "").output().unwrap();
         assert_eq!(output.status.code(), Some(2), "{args:?}");
-        assert!(text(&output.stderr).contains("使い方:"));
+        assert!(text(&output.stderr).contains("Usage:"));
         assert!(output.stdout.is_empty());
     }
 }
@@ -666,9 +664,9 @@ fn help_and_version_do_not_require_git_or_a_repository() {
     let output = repo.run(&["br", "--help"]);
     assert_success(&output);
     let help = text(&output.stdout);
-    assert!(help.contains("使い方: giclean br [--dry-run]"));
-    assert!(help.contains("origin の最新の既定ブランチ"));
-    assert!(help.contains("通常実行は確認なしで削除します"));
+    assert!(help.contains("Usage: giclean br [--dry-run]"));
+    assert!(help.contains("origin's latest default branch"));
+    assert!(help.contains("Deletes without confirmation"));
 }
 
 #[cfg(unix)]
@@ -734,9 +732,9 @@ mod unix {
             assert_eq!(
                 text(&output.stdout),
                 if mismatch == "none" {
-                    "deleted: 1"
+                    "squash: deleted"
                 } else {
-                    "deleted: 0"
+                    ""
                 },
                 "{mismatch}"
             );
@@ -853,7 +851,12 @@ mod unix {
                 transcript.extend(bytes);
             }
             redraws_during_input.push(transcript[start..].contains(&b'\x1b'));
-            input.write_all(reply.as_bytes()).unwrap();
+            input.write_all(reply.as_bytes()).unwrap_or_else(|error| {
+                panic!(
+                    "reply to {prompt} failed: {error}; {}",
+                    String::from_utf8_lossy(&transcript)
+                );
+            });
             input.flush().unwrap();
         }
         let status = child.wait().unwrap();
@@ -871,7 +874,7 @@ mod unix {
     }
 
     #[test]
-    fn terminal_progress_pauses_during_remote_wait_and_completes_dry_run() {
+    fn terminal_progress_updates_one_line_and_completes_dry_run() {
         let repo = Repo::new();
         repo.git(&["branch", "merged"]);
         let mut command = shim(&repo, "if [ \"$1\" = ls-remote ]; then sleep 0.4; fi");
@@ -880,57 +883,105 @@ mod unix {
         assert_success(&output);
         let display = text(&output.stdout);
         assert!(display.contains("\r\x1b[2K⠋"), "{display}");
-        let remote_wait = display
-            .split_once("… origin の既定ブランチと最新コミットを確認中…")
-            .unwrap()
-            .1
-            .split_once("✔ origin の既定ブランチと最新コミットを確認")
-            .unwrap()
-            .0;
-        assert!(!remote_wait.contains('⠙'), "{display}");
-        assert!(!remote_wait.contains('⠹'), "{display}");
-        assert!(display.contains("秒"), "{display}");
-        assert!(display.contains("✔ origin の既定ブランチと最新コミットを確認"));
-        assert!(display.contains("candidate: merged"));
-        assert!(display.contains("✔ 削除候補 1件の確認が完了"));
+        let before_results = display.split_once("candidate: merged").unwrap().0;
+        assert!(!before_results.contains('\n'), "{display}");
+        assert!(before_results.contains("Checking origin's default branch and latest commit..."));
+        assert!(before_results.contains("Checking merged branches..."));
+        assert!(!display.contains("秒"), "{display}");
+        assert!(!display.contains('✔'), "{display}");
+        assert!(display.ends_with("candidate: merged"), "{display}");
         assert!(repo.exists("merged"));
         assert!(!repo.work.join(".git/FETCH_HEAD").exists());
     }
 
     #[test]
-    fn terminal_progress_reports_the_actual_deletion_count() {
+    fn terminal_progress_reports_deleted_branches_after_clearing_the_spinner() {
         let repo = Repo::new();
-        repo.git(&["branch", "merged"]);
+        for branch in ["merged", "日本語/マージ済み"] {
+            repo.git(&["branch", branch]);
+        }
         let command = shim(&repo, "if [ \"$1\" = branch ]; then sleep 0.2; fi");
         let output = in_terminal(&command);
         assert_success(&output);
         let display = text(&output.stdout);
         assert!(display.contains("⠙"), "{display}");
-        assert!(display.contains("✔ 1件のブランチを削除しました"));
-        assert!(display.contains("deleted: 1"));
+        assert!(!display.contains("秒"), "{display}");
+        assert!(!display.contains('✔'), "{display}");
+        let (progress, results) = display.split_once("merged: deleted").unwrap();
+        assert!(!progress.contains('\n'), "{display}");
+        assert!(progress.ends_with("\r\x1b[2K"), "{display}");
+        assert_eq!(results, "\r\n日本語/マージ済み: deleted");
         assert!(!repo.exists("merged"));
+        assert!(!repo.exists("日本語/マージ済み"));
         assert!(repo.exists("main"));
     }
 
     #[test]
-    fn terminal_progress_stops_for_child_diagnostics_and_marks_the_failed_stage() {
+    fn terminal_progress_stops_for_child_diagnostics_and_clears_on_failure() {
         let repo = Repo::new();
         repo.git(&["branch", "merged"]);
         let command = shim(
             &repo,
-            "if [ \"$1\" = ls-remote ]; then printf 'remote diagnostic' >&2; sleep 0.3; exit 23; fi",
+            "if [ \"$1\" = for-each-ref ]; then printf 'local diagnostic' >&2; sleep 0.3; exit 23; fi",
         );
         let output = in_terminal(&command);
         let display = text(&output.stdout);
-        let after_diagnostic = display.split_once("remote diagnostic").unwrap().1;
-        assert!(after_diagnostic.starts_with("\r\n\r\x1b[2K✘"), "{display}");
-        assert!(after_diagnostic.contains("git ls-remote が失敗しました"));
-        assert!(!display.contains("✔ origin の既定ブランチと最新コミットを確認"));
+        let after_diagnostic = display.split_once("local diagnostic").unwrap().1;
+        assert!(after_diagnostic.starts_with("\r\ngiclean:"), "{display}");
+        assert!(after_diagnostic.contains("git for-each-ref failed"));
+        assert!(!after_diagnostic.contains('\x1b'), "{display}");
+        assert!(!display.contains('✘'), "{display}");
+        assert!(!display.contains(": deleted"), "{display}");
         assert!(repo.exists("merged"));
     }
 
     #[test]
-    fn dumb_terminals_use_plain_progress() {
+    fn terminal_remote_diagnostics_survive_progress_resuming() {
+        for diagnostic in ["remote diagnostic", "remote diagnostic\\n"] {
+            let repo = Repo::new();
+            repo.git(&["branch", "merged"]);
+            let before = repo.git(&["show-ref"]);
+            let hook =
+                format!("if [ \"$1\" = ls-remote ]; then printf '{diagnostic}' >&2; sleep 0.3; fi");
+            let mut command = shim(&repo, &hook);
+            command.arg("--dry-run");
+            let output = in_terminal(&command);
+            assert_success(&output);
+            let display = text(&output.stdout);
+            let after_diagnostic = display.split_once("remote diagnostic").unwrap().1;
+            assert!(
+                after_diagnostic.starts_with("\r\n\r\x1b[2K⠋ Checking merged branches..."),
+                "{display}"
+            );
+            assert!(display.ends_with("candidate: merged"), "{display}");
+            assert_eq!(repo.git(&["show-ref"]), before);
+            assert!(!repo.work.join(".git/FETCH_HEAD").exists());
+        }
+    }
+
+    #[test]
+    fn terminal_remote_diagnostics_are_separated_from_errors() {
+        for diagnostic in ["remote diagnostic", "remote diagnostic\\n"] {
+            let repo = Repo::new();
+            repo.git(&["branch", "merged"]);
+            let before = repo.git(&["show-ref"]);
+            let hook = format!(
+                "if [ \"$1\" = ls-remote ]; then printf '{diagnostic}' >&2; sleep 0.3; exit 23; fi"
+            );
+            let output = in_terminal(&shim(&repo, &hook));
+            let display = text(&output.stdout);
+            let after_diagnostic = display.split_once("remote diagnostic").unwrap().1;
+            assert_eq!(
+                after_diagnostic, "\r\ngiclean: git ls-remote failed (exit status: 23)",
+                "{display}"
+            );
+            assert_eq!(repo.git(&["show-ref"]), before);
+            assert!(!repo.work.join(".git/FETCH_HEAD").exists());
+        }
+    }
+
+    #[test]
+    fn dumb_terminals_only_show_results() {
         let repo = Repo::new();
         repo.git(&["branch", "merged"]);
         let mut command = repo.cli();
@@ -938,9 +989,11 @@ mod unix {
         let output = in_terminal(&command);
         assert_success(&output);
         let display = text(&output.stdout);
-        assert!(!display.contains('\x1b'));
-        assert!(display.contains("giclean: ローカルブランチを確認しています..."));
-        assert!(display.contains("candidate: merged"));
+        // BSD script can echo EOF as ^D followed by backspaces before output.
+        assert!(!display.contains('\x1b'), "{display}");
+        assert!(!display.contains("giclean:"), "{display}");
+        assert!(display.ends_with("candidate: merged"), "{display}");
+        assert_eq!(display.lines().count(), 1, "{display}");
     }
 
     // Intercept only the child Git process. Every underlying Git operation is real,
@@ -1135,19 +1188,11 @@ mod unix {
     }
 
     #[test]
-    fn queries_the_remote_once_and_prints_progress_before_the_query() {
+    fn queries_the_remote_once_without_plain_progress() {
         let repo = Repo::new();
         repo.git(&["branch", "merged"]);
-        let progress = repo.root.join("progress");
-        let hook = format!(
-            "if [ \"$1\" = ls-remote ]; then\ncase \"$(cat {})\" in\n*'giclean: origin の既定ブランチと最新コミットを確認しています...') ;;\n*) exit 90 ;;\nesac\nfi",
-            shell_quote(&progress),
-        );
-        let output = shim(&repo, &hook)
-            .arg("--dry-run")
-            .stderr(fs::File::create(&progress).unwrap())
-            .output()
-            .unwrap();
+        let output = shim(&repo, "").arg("--dry-run").output().unwrap();
+        assert!(output.stderr.is_empty());
         assert_success(&output);
         assert_eq!(text(&output.stdout), "candidate: merged");
         let calls = fs::read_to_string(repo.root.join("calls")).unwrap();
@@ -1324,7 +1369,7 @@ mod unix {
             );
             let output = shim(&repo, &hook).output().unwrap();
             assert_success(&output);
-            assert_eq!(text(&output.stdout), "deleted: 0");
+            assert_eq!(text(&output.stdout), "");
             assert!(repo.exists("squash"));
         }
     }
@@ -1347,7 +1392,7 @@ mod unix {
         );
         let output = shim(&repo, &hook).output().unwrap();
         assert_success(&output);
-        assert_eq!(text(&output.stdout), "deleted: 1");
+        assert_eq!(text(&output.stdout), "merged: deleted");
         assert_eq!(repo.git(&["rev-parse", "moving"]), tip);
         assert_eq!(
             repo.git(&["rev-parse", "moving-merged"]),
@@ -1371,7 +1416,7 @@ mod unix {
         );
         let output = shim(&repo, &hook).output().unwrap();
         assert_success(&output);
-        assert_eq!(text(&output.stdout), "deleted: 0");
+        assert_eq!(text(&output.stdout), "");
         assert!(repo.exists("moving"));
         assert_eq!(
             repo.git(&["rev-parse", "moving"]),
@@ -1380,7 +1425,7 @@ mod unix {
     }
 
     #[test]
-    fn deletion_failure_returns_one_and_reports_the_successful_count() {
+    fn deletion_failure_returns_one_and_reports_successful_branches() {
         let repo = Repo::new();
         repo.git(&["branch", "a-blocked"]);
         repo.git(&["branch", "z-merged"]);
@@ -1390,10 +1435,69 @@ mod unix {
         );
         let output = shim(&repo, &hook).output().unwrap();
         assert_eq!(output.status.code(), Some(1));
-        assert_eq!(text(&output.stdout), "deleted: 1");
+        assert_eq!(
+            text(&output.stdout),
+            "a-blocked: failed (checked out in a worktree)\nz-merged: deleted"
+        );
         assert!(repo.exists("a-blocked"));
         assert!(!repo.exists("z-merged"));
-        assert!(text(&output.stderr).contains("1 件のブランチを削除できませんでした"));
+        assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn deletion_lock_errors_preserve_the_reason_and_continue() {
+        let repo = Repo::new();
+        repo.git(&["branch", "a-locked"]);
+        repo.git(&["branch", "z-merged"]);
+        fs::write(repo.work.join(".git/refs/heads/a-locked.lock"), "").unwrap();
+        let output = repo.run(&["br"]);
+        assert_eq!(output.status.code(), Some(1));
+        let results = text(&output.stdout);
+        let rows: Vec<_> = results.lines().collect();
+        assert_eq!(rows.len(), 2, "{results}");
+        assert!(rows[0].starts_with("a-locked: failed ("), "{results}");
+        assert!(rows[0].contains("a-locked.lock"), "{results}");
+        assert!(rows[0].contains("File exists"), "{results}");
+        assert_eq!(rows[1], "z-merged: deleted");
+        assert!(output.stderr.is_empty());
+        assert!(repo.exists("a-locked"));
+        assert!(!repo.exists("z-merged"));
+    }
+
+    #[test]
+    fn deletion_failure_without_diagnostics_reports_the_exit_status() {
+        let repo = Repo::new();
+        repo.git(&["branch", "a-blocked"]);
+        repo.git(&["branch", "z-merged"]);
+        let hook = "if [ \"$1\" = branch ]; then [ \"$LC_ALL\" = C ] || exit 90; if [ \"${5:-}\" = a-blocked ]; then exit 23; fi; fi";
+        let output = shim(&repo, hook).output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            text(&output.stdout),
+            "a-blocked: failed (git branch failed with exit status: 23)\nz-merged: deleted"
+        );
+        assert!(output.stderr.is_empty());
+        assert!(repo.exists("a-blocked"));
+        assert!(!repo.exists("z-merged"));
+    }
+
+    #[test]
+    fn terminal_deletion_failures_are_reported_after_clearing_the_spinner() {
+        let repo = Repo::new();
+        repo.git(&["branch", "a-blocked"]);
+        repo.git(&["branch", "z-merged"]);
+        let hook = format!(
+            "if [ \"$1\" = branch ] && [ \"${{5:-}}\" = a-blocked ]; then\n\"$real_git\" worktree add -q {} a-blocked\nsleep 0.3\nfi",
+            shell_quote(&repo.root.join("late-worktree")),
+        );
+        let output = in_terminal(&shim(&repo, &hook));
+        let display = text(&output.stdout);
+        let (progress, results) = display.split_once("a-blocked: failed").unwrap();
+        assert!(!progress.contains('\n'), "{display}");
+        assert!(progress.ends_with("\r\x1b[2K"), "{display}");
+        assert_eq!(results, " (checked out in a worktree)\r\nz-merged: deleted");
+        assert!(repo.exists("a-blocked"));
+        assert!(!repo.exists("z-merged"));
     }
 
     #[test]
@@ -1405,7 +1509,7 @@ mod unix {
         let hook = "if [ \"$1\" = for-each-ref ] && [ \"${4:-}\" = refs/heads/b-unreadable ]; then\nexit 91\nfi";
         let output = shim(&repo, hook).output().unwrap();
         assert_eq!(output.status.code(), Some(1));
-        assert_eq!(text(&output.stdout), "deleted: 1");
+        assert_eq!(text(&output.stdout), "a-merged: deleted");
         assert!(!repo.exists("a-merged"));
         assert!(repo.exists("b-unreadable"));
         assert!(repo.exists("z-merged"));
