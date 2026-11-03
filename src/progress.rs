@@ -1,47 +1,34 @@
 use std::env;
 use std::io::{self, IsTerminal, Read, Write};
-use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct Display {
     message: String,
-    started: Instant,
     visible: bool,
 }
 
 impl Display {
-    fn draw(&self, marker: &str, done: bool) {
+    fn draw(&self, marker: &str) {
         let mut stderr = io::stderr().lock();
-        if done && !self.visible {
-            let _ = writeln!(stderr);
-        }
-        let _ = write!(
-            stderr,
-            "\r\x1b[2K{marker} {}  {:.1}秒{}",
-            self.message,
-            self.started.elapsed().as_secs_f32(),
-            if done { "\n" } else { "" }
-        );
+        let _ = write!(stderr, "\r\x1b[2K{marker} {}", self.message);
         let _ = stderr.flush();
     }
 }
 
-/// Owns one progress line. Dropping an unfinished stage marks it as failed.
+/// Owns one transient progress line, cleared when processing ends.
 pub struct Progress {
     display: Option<Arc<Mutex<Display>>>,
     worker: Option<(mpsc::Sender<()>, JoinHandle<()>)>,
 }
 
 impl Progress {
-    pub fn start(message: &str, plain: Option<&str>) -> Self {
+    pub fn start(message: &str) -> Self {
         let enabled =
             io::stderr().is_terminal() && env::var_os("TERM").is_none_or(|term| term != "dumb");
         if !enabled {
-            if let Some(plain) = plain {
-                eprintln!("giclean: {plain}");
-            }
             return Self {
                 display: None,
                 worker: None,
@@ -49,10 +36,9 @@ impl Progress {
         }
         let display = Arc::new(Mutex::new(Display {
             message: message.to_owned(),
-            started: Instant::now(),
             visible: true,
         }));
-        display.lock().unwrap().draw("⠋", false);
+        display.lock().unwrap().draw("⠋");
         let state = Arc::clone(&display);
         let (send, receive) = mpsc::channel();
         let worker = thread::spawn(move || {
@@ -64,7 +50,7 @@ impl Progress {
             ) {
                 let display = state.lock().unwrap();
                 if display.visible {
-                    display.draw(frames[frame % frames.len()], false);
+                    display.draw(frames[frame % frames.len()]);
                     frame += 1;
                 }
             }
@@ -75,26 +61,23 @@ impl Progress {
         }
     }
 
-    pub fn update(&self, message: String) {
+    pub fn update(&self, message: &str) {
         if let Some(display) = &self.display {
-            display.lock().unwrap().message = message;
+            let mut display = display.lock().unwrap();
+            display.message = message.to_owned();
+            display.visible = true;
+            display.draw("⠋");
         }
     }
 
     // Git, SSH, and credential helpers can write prompts directly to /dev/tty.
     // Stop drawing before starting any operation that can ask for input.
     pub fn pause_for_input(&self) {
-        if let Some(display) = &self.display {
-            let mut display = display.lock().unwrap();
-            if display.visible {
-                display.draw("…", true);
-                display.visible = false;
-            }
-        }
+        self.suspend();
     }
 
     // Clear the progress line for stdout and child diagnostics.
-    // Once another writer uses the terminal, stop redrawing for this stage.
+    // Drawing resumes only when the next progress message is set.
     pub fn suspend(&self) {
         if let Some(display) = &self.display {
             let mut display = display.lock().unwrap();
@@ -107,15 +90,9 @@ impl Progress {
         }
     }
 
-    pub fn finish(mut self, message: &str, plain: Option<&str>) {
+    pub fn finish(mut self) {
         self.stop();
-        if let Some(display) = self.display.take() {
-            let mut display = display.lock().unwrap();
-            display.message = message.to_owned();
-            display.draw("✔", true);
-        } else if let Some(plain) = plain {
-            eprintln!("giclean: {plain}");
-        }
+        self.suspend();
     }
 
     pub fn output(&self, command: &mut Command) -> io::Result<Output> {
@@ -138,27 +115,22 @@ impl Progress {
         })
     }
 
-    pub fn status(&self, command: &mut Command) -> io::Result<ExitStatus> {
-        self.run(command, |mut child| child.wait())
-    }
-
     fn run<T>(
         &self,
         command: &mut Command,
         wait: impl FnOnce(Child) -> io::Result<T>,
     ) -> io::Result<T> {
-        if self
-            .display
-            .as_ref()
-            .is_none_or(|display| !display.lock().unwrap().visible)
-        {
+        if self.display.is_none() {
             return wait(command.spawn()?);
         }
+        // Forward diagnostics even while drawing is paused for authentication,
+        // so an unfinished line is terminated before any later redraw or error.
         let mut child = command.stderr(Stdio::piped()).spawn()?;
         let mut stderr = child.stderr.take().unwrap();
         thread::scope(|scope| {
             scope.spawn(|| {
                 let mut buffer = [0; 4096];
+                let mut needs_newline = false;
                 loop {
                     match stderr.read(&mut buffer) {
                         Ok(0) => break,
@@ -167,10 +139,14 @@ impl Progress {
                             let mut out = io::stderr().lock();
                             let _ = out.write_all(&buffer[..size]);
                             let _ = out.flush();
+                            needs_newline = buffer[size - 1] != b'\n';
                         }
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
                     }
+                }
+                if needs_newline {
+                    eprintln!();
                 }
             });
             wait(child)
@@ -188,8 +164,6 @@ impl Progress {
 impl Drop for Progress {
     fn drop(&mut self) {
         self.stop();
-        if let Some(display) = &self.display {
-            display.lock().unwrap().draw("✘", true);
-        }
+        self.suspend();
     }
 }
