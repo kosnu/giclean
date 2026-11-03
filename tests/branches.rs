@@ -900,7 +900,7 @@ mod unix {
         for branch in ["merged", "日本語/マージ済み"] {
             repo.git(&["branch", branch]);
         }
-        let command = shim(&repo, "if [ \"$1\" = branch ]; then sleep 0.2; fi");
+        let command = shim(&repo, "case \"$1\" in branch|-c) sleep 0.2 ;; esac");
         let output = in_terminal(&command);
         assert_success(&output);
         let display = text(&output.stdout);
