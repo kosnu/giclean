@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -28,6 +28,7 @@ const BRANCHES_HELP: &str = "giclean br — マージ済みのローカルブラ
 使い方: giclean br [--dry-run]
 
 origin の最新の既定ブランチにマージ済みのローカルブランチを削除します。
+squash は変更した全パスの内容・権限が一致する場合に対象とします。
 
 オプション:
   --dry-run   削除候補だけを表示
@@ -46,7 +47,7 @@ enum Action {
     Version,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Branch {
     name: String,
     oid: String,
@@ -151,6 +152,162 @@ fn git_command_text(
     }
     String::from_utf8(output.stdout)
         .map_err(|_| "Git の出力に UTF-8 以外の文字が含まれるため停止しました。".into())
+}
+
+type TreeChanges = BTreeMap<Vec<u8>, Vec<u8>>;
+
+// Compare tree objects in one Git process. Each response must have the requested
+// pair header, followed by raw NUL records; filenames are never decoded as text.
+fn tree_changes(
+    pairs: &BTreeSet<(String, String)>,
+    progress: &Progress,
+) -> Result<BTreeMap<(String, String), TreeChanges>, String> {
+    let input: String = pairs
+        .iter()
+        .map(|(base, tip)| format!("{base} {tip}\n"))
+        .collect();
+    let mut command = git(&[
+        "diff-tree",
+        "--stdin",
+        "--raw",
+        "-r",
+        "-z",
+        "--no-abbrev",
+        "--no-renames",
+        "--no-relative",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--ignore-submodules=none",
+    ]);
+    let output = progress
+        .output_with_input(&mut command, input.as_bytes())
+        .map_err(|e| format!("git diff-tree を実行できません: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git diff-tree が失敗しました ({})。",
+            output.status
+        ));
+    }
+    let error = "ツリーの変更を解釈できないため停止しました。";
+    let mut remaining = output.stdout.as_slice();
+    let mut results = BTreeMap::new();
+    for pair in pairs {
+        let header = format!("{} {}\n", pair.0, pair.1);
+        remaining = remaining.strip_prefix(header.as_bytes()).ok_or(error)?;
+        let mut changes = BTreeMap::new();
+        while remaining.starts_with(b":") {
+            let mut fields = remaining.splitn(3, |byte| *byte == 0);
+            let change = fields.next().ok_or(error)?;
+            let path = fields.next().filter(|path| !path.is_empty()).ok_or(error)?;
+            remaining = fields.next().ok_or(error)?;
+            if changes.insert(path.to_vec(), change.to_vec()).is_some() {
+                return Err(error.into());
+            }
+        }
+        results.insert(pair.clone(), changes);
+    }
+    if !remaining.is_empty() {
+        return Err(error.into());
+    }
+    Ok(results)
+}
+
+fn squash_included(
+    tips: &[&str],
+    target: &str,
+    progress: &Progress,
+) -> Result<BTreeSet<String>, String> {
+    // Bound argv size and the number of tree diffs retained at once. All reuse is
+    // scoped to this run and immutable object IDs, never branch names or refs.
+    const BATCH_SIZE: usize = 128;
+    let error = "共通祖先を解釈できないため停止しました。";
+    let mut bases = BTreeMap::new();
+    for chunk in tips.chunks(BATCH_SIZE) {
+        // A...B expands to B, A, and every merge-base prefixed by ^. Git performs
+        // the same merge-base --all calculation, without one process per branch.
+        let mut command = git(&["rev-parse", "--revs-only", "--end-of-options"]);
+        command.args(chunk.iter().map(|tip| format!("{tip}...{target}")));
+        let output = git_command_text(command, "rev-parse", progress)?;
+        let mut lines = output.lines().peekable();
+        for tip in chunk {
+            if lines.next() != Some(target) || lines.next() != Some(*tip) {
+                return Err(error.into());
+            }
+            let mut ancestors = Vec::new();
+            while let Some(base) = lines.peek().and_then(|line| line.strip_prefix('^')) {
+                if !valid_oid(base) {
+                    return Err(error.into());
+                }
+                ancestors.push(base);
+                lines.next();
+            }
+            // Unrelated histories and multiple best ancestors remain ineligible.
+            if ancestors.len() == 1 {
+                bases.insert((*tip).to_owned(), ancestors[0].to_owned());
+            }
+        }
+        if lines.next().is_some() {
+            return Err(error.into());
+        }
+    }
+    if bases.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let commits: BTreeSet<_> = bases
+        .iter()
+        .flat_map(|(tip, base)| [tip.as_str(), base.as_str()])
+        .chain(std::iter::once(target))
+        .collect();
+    let commits: Vec<_> = commits.into_iter().collect();
+    let mut trees = BTreeMap::new();
+    for chunk in commits.chunks(BATCH_SIZE) {
+        let mut command = git(&["rev-parse", "--revs-only", "--end-of-options"]);
+        command.args(chunk.iter().map(|commit| format!("{commit}^{{tree}}")));
+        let output = git_command_text(command, "rev-parse", progress)?;
+        let ids: Vec<_> = output.lines().collect();
+        if ids.len() != chunk.len() || ids.iter().any(|oid| !valid_oid(oid)) {
+            return Err("ツリーの ID を解釈できないため停止しました。".into());
+        }
+        trees.extend(
+            chunk
+                .iter()
+                .zip(ids)
+                .map(|(commit, tree)| (*commit, tree.to_owned())),
+        );
+    }
+    let mut included = BTreeSet::new();
+    let branches: Vec<_> = bases.iter().collect();
+    for chunk in branches.chunks(BATCH_SIZE) {
+        let pairs: BTreeSet<_> = chunk
+            .iter()
+            .filter(|(tip, base)| trees[tip.as_str()] != trees[base.as_str()])
+            .flat_map(|(tip, base)| {
+                [
+                    (trees[base.as_str()].clone(), trees[tip.as_str()].clone()),
+                    (trees[base.as_str()].clone(), trees[target].clone()),
+                ]
+            })
+            .collect();
+        if pairs.is_empty() {
+            continue;
+        }
+        let diffs = tree_changes(&pairs, progress)?;
+        for (tip, base) in chunk {
+            if trees[tip.as_str()] == trees[base.as_str()] {
+                continue;
+            }
+            let changes = &diffs[&(trees[base.as_str()].clone(), trees[tip.as_str()].clone())];
+            let target_changes = &diffs[&(trees[base.as_str()].clone(), trees[target].clone())];
+            if !changes.is_empty()
+                && changes
+                    .iter()
+                    .all(|(path, change)| target_changes.get(path) == Some(change))
+            {
+                included.insert((*tip).clone());
+            }
+        }
+    }
+    Ok(included)
 }
 
 fn branch_snapshot(
@@ -274,7 +431,22 @@ fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<(), String> {
         "マージ済みブランチを判定中…",
         Some("マージ済みブランチを判定しています..."),
     );
-    let merged = branch_snapshot(Some(&remote.oid), None, &progress)?;
+    let mut merged = branch_snapshot(Some(&remote.oid), None, &progress)?;
+    let tips: BTreeSet<_> = initial
+        .iter()
+        .filter(|(name, _)| *name != &remote.branch && !merged.contains_key(*name))
+        .map(|(_, branch)| branch.oid.as_str())
+        .collect();
+    let included = squash_included(
+        &tips.into_iter().collect::<Vec<_>>(),
+        &remote.oid,
+        &progress,
+    )?;
+    for (name, branch) in &initial {
+        if name != &remote.branch && !merged.contains_key(name) && included.contains(&branch.oid) {
+            merged.insert(name.clone(), branch.clone());
+        }
+    }
     progress.finish("マージ済みブランチを判定", None);
     let progress = Progress::start(
         if dry_run {

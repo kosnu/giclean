@@ -123,6 +123,21 @@ impl Progress {
         self.run(command, Child::wait_with_output)
     }
 
+    pub fn output_with_input(&self, command: &mut Command, input: &[u8]) -> io::Result<Output> {
+        command.stdin(Stdio::piped()).stdout(Stdio::piped());
+        self.run(command, |mut child| {
+            let mut stdin = child.stdin.take().unwrap();
+            // Drain stdout/stderr while feeding stdin so large batches cannot
+            // deadlock when both input and output exceed pipe capacity.
+            thread::scope(|scope| {
+                let writer = scope.spawn(move || stdin.write_all(input));
+                let output = child.wait_with_output();
+                writer.join().unwrap()?;
+                output
+            })
+        })
+    }
+
     pub fn status(&self, command: &mut Command) -> io::Result<ExitStatus> {
         self.run(command, |mut child| child.wait())
     }

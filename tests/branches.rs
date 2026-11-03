@@ -105,6 +105,23 @@ impl Repo {
         text(&output.stdout).to_owned()
     }
 
+    fn git_input(&self, args: &[&str], input: &[u8]) -> String {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let mut command = self.git_command();
+        command
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_success(&output);
+        text(&output.stdout).to_owned()
+    }
+
     fn exists(&self, branch: &str) -> bool {
         self.git_command()
             .args([
@@ -153,7 +170,7 @@ fn assert_success(output: &Output) {
 }
 
 #[test]
-fn dry_run_preserves_squash_unmerged_current_protected_and_used_branches() {
+fn dry_run_includes_squash_and_preserves_unmerged_current_protected_and_used_branches() {
     let repo = Repo::new();
     repo.git(&["switch", "-c", "merged"]);
     repo.git(&["commit", "--allow-empty", "-m", "feature"]);
@@ -180,7 +197,7 @@ fn dry_run_preserves_squash_unmerged_current_protected_and_used_branches() {
     let before = repo.git(&["show-ref"]);
     let output = repo.run(&["br", "--dry-run"]);
     assert_success(&output);
-    assert_eq!(text(&output.stdout), "candidate: merged");
+    assert_eq!(text(&output.stdout), "candidate: merged\ncandidate: squash");
     assert_eq!(repo.git(&["show-ref"]), before);
     let progress = text(&output.stderr);
     assert!(progress.starts_with("giclean: ローカルブランチを確認しています..."));
@@ -189,6 +206,150 @@ fn dry_run_preserves_squash_unmerged_current_protected_and_used_branches() {
     assert!(!progress.contains('\x1b'));
     assert!(!progress.contains('\r'));
     assert!(!repo.work.join(".git/FETCH_HEAD").exists());
+}
+
+#[test]
+fn squash_deletion_matches_complete_changes_with_other_default_branch_changes() {
+    for format in ["sha1", "sha256"] {
+        let repo = Repo::with_format(format);
+        for path in ["edited", "deleted", "renamed"] {
+            fs::write(repo.work.join(path), "base\n").unwrap();
+        }
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "base files"]);
+        repo.git(&["switch", "-c", "squash"]);
+        fs::write(repo.work.join("edited"), "changed\n").unwrap();
+        repo.git(&["rm", "deleted"]);
+        repo.git(&["mv", "renamed", "renamed\twith\nspaces"]);
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "first feature commit"]);
+        fs::write(repo.work.join("binary"), [0, 255, 1, 2]).unwrap();
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "second feature commit"]);
+        repo.git(&["switch", "main"]);
+        fs::write(repo.work.join("unrelated"), "another feature\n").unwrap();
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "independent change before squash"]);
+        repo.git(&["merge", "--squash", "squash"]);
+        repo.git(&["commit", "-m", "squash merge"]);
+        fs::write(repo.work.join("unrelated"), "updated\n").unwrap();
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "independent change after squash"]);
+        repo.git(&["push", "origin", "main"]);
+        repo.git(&["config", "diff.relative", "true"]);
+        repo.git(&["config", "diff.renames", "copies"]);
+        repo.git(&["config", "branch.squash.description", "cleanup"]);
+        fs::write(repo.work.join("edited"), "local uncommitted edit\n").unwrap();
+        let subdir = repo.work.join("subdir");
+        fs::create_dir(&subdir).unwrap();
+
+        let output = repo.cli().arg("br").current_dir(subdir).output().unwrap();
+        assert_success(&output);
+        assert_eq!(text(&output.stdout), "deleted: 1", "{format}");
+        assert!(!repo.exists("squash"));
+        assert_eq!(
+            fs::read(repo.work.join("edited")).unwrap(),
+            b"local uncommitted edit\n"
+        );
+        assert!(!repo.work.join(".git/FETCH_HEAD").exists());
+        assert!(
+            !repo
+                .git_command()
+                .args(["config", "--get", "branch.squash.description"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+}
+
+#[test]
+fn squash_preserves_partial_reverted_later_edited_and_extra_tip_changes() {
+    for case in ["partial", "reverted", "later-edit", "extra-tip"] {
+        let repo = Repo::new();
+        repo.git(&["switch", "-c", "squash"]);
+        for path in ["first", "second"] {
+            fs::write(repo.work.join(path), "feature\n").unwrap();
+        }
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "feature"]);
+        repo.git(&["switch", "main"]);
+        if case == "partial" {
+            fs::write(repo.work.join("first"), "feature\n").unwrap();
+            repo.git(&["add", "."]);
+        } else {
+            repo.git(&["merge", "--squash", "squash"]);
+        }
+        repo.git(&["commit", "-m", "integration"]);
+        if case == "reverted" {
+            repo.git(&["revert", "--no-edit", "HEAD"]);
+        } else if case == "later-edit" {
+            fs::write(repo.work.join("first"), "feature plus later edit\n").unwrap();
+            repo.git(&["add", "."]);
+            repo.git(&["commit", "-m", "later edit"]);
+        } else if case == "extra-tip" {
+            repo.git(&["switch", "squash"]);
+            fs::write(repo.work.join("extra"), "unmerged\n").unwrap();
+            repo.git(&["add", "."]);
+            repo.git(&["commit", "-m", "unmerged follow-up"]);
+            repo.git(&["switch", "main"]);
+        }
+        repo.git(&["push", "origin", "main"]);
+        let output = repo.run(&["br"]);
+        assert_success(&output);
+        assert_eq!(text(&output.stdout), "deleted: 0", "{case}");
+        assert!(repo.exists("squash"));
+    }
+}
+
+#[test]
+fn unrelated_histories_are_preserved() {
+    let repo = Repo::new();
+    repo.git(&["switch", "--orphan", "unrelated"]);
+    repo.git(&["commit", "--allow-empty", "-m", "unrelated root"]);
+    repo.git(&["switch", "main"]);
+    let output = repo.run(&["br"]);
+    assert_success(&output);
+    assert_eq!(text(&output.stdout), "deleted: 0");
+    assert!(repo.exists("unrelated"));
+}
+
+#[test]
+fn multiple_merge_bases_are_preserved_in_a_batch_with_an_eligible_branch() {
+    let repo = Repo::new();
+    repo.git(&["switch", "-c", "ambiguous"]);
+    fs::write(repo.work.join("first"), "first side\n").unwrap();
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "first side"]);
+    repo.git(&["switch", "main"]);
+    fs::write(repo.work.join("second"), "second side\n").unwrap();
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "second side"]);
+    repo.git(&["tag", "second-side"]);
+    repo.git(&["merge", "--no-ff", "ambiguous", "-m", "merge first side"]);
+    repo.git(&["switch", "ambiguous"]);
+    repo.git(&["merge", "--no-ff", "second-side", "-m", "merge second side"]);
+    repo.git(&["switch", "main"]);
+    assert_eq!(
+        repo.git(&["merge-base", "--all", "main", "ambiguous"])
+            .lines()
+            .count(),
+        2
+    );
+    repo.git(&["switch", "-c", "squash"]);
+    fs::write(repo.work.join("feature"), "squashed\n").unwrap();
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "feature"]);
+    repo.git(&["switch", "main"]);
+    repo.git(&["merge", "--squash", "squash"]);
+    repo.git(&["commit", "-m", "squash merge"]);
+    repo.git(&["push", "origin", "main"]);
+    let output = repo.run(&["br"]);
+    assert_success(&output);
+    assert_eq!(text(&output.stdout), "deleted: 1");
+    assert!(repo.exists("ambiguous"));
+    assert!(!repo.exists("squash"));
 }
 
 #[test]
@@ -515,6 +676,76 @@ mod unix {
     use super::*;
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn squash_checks_modes_symlinks_and_gitlinks_and_keeps_protected_branches() {
+        for mismatch in ["none", "mode", "symlink", "gitlink"] {
+            let repo = Repo::new();
+            let root = repo.git(&["rev-parse", "HEAD"]);
+            fs::write(repo.work.join("script"), "same content\n").unwrap();
+            repo.git(&["add", "."]);
+            repo.git(&["commit", "-m", "base file"]);
+            let base = repo.git(&["rev-parse", "HEAD"]);
+            repo.git(&["switch", "-c", "squash"]);
+            fs::set_permissions(repo.work.join("script"), fs::Permissions::from_mode(0o755))
+                .unwrap();
+            std::os::unix::fs::symlink("script", repo.work.join("link")).unwrap();
+            repo.git(&["add", "."]);
+            repo.git(&[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{base},module"),
+            ]);
+            repo.git(&["commit", "-m", "feature modes link and gitlink"]);
+            for name in ["squash-used", "master", "production"] {
+                repo.git(&["branch", name]);
+            }
+            repo.git(&["switch", "main"]);
+            repo.add_worktree("squash-used", "used");
+            repo.git(&["merge", "--squash", "squash"]);
+            repo.git(&["commit", "-m", "squash merge"]);
+            match mismatch {
+                "mode" => {
+                    repo.git(&["update-index", "--chmod=-x", "script"]);
+                }
+                "symlink" => {
+                    fs::remove_file(repo.work.join("link")).unwrap();
+                    std::os::unix::fs::symlink("another-target", repo.work.join("link")).unwrap();
+                    repo.git(&["add", "link"]);
+                }
+                "gitlink" => {
+                    repo.git(&[
+                        "update-index",
+                        "--cacheinfo",
+                        &format!("160000,{root},module"),
+                    ]);
+                }
+                _ => {}
+            }
+            if mismatch != "none" {
+                repo.git(&["commit", "-m", "different metadata"]);
+            }
+            repo.git(&["push", "origin", "main"]);
+            // A user setting must not hide submodule differences.
+            repo.git(&["config", "diff.ignoreSubmodules", "all"]);
+            let output = repo.run(&["br"]);
+            assert_success(&output);
+            assert_eq!(
+                text(&output.stdout),
+                if mismatch == "none" {
+                    "deleted: 1"
+                } else {
+                    "deleted: 0"
+                },
+                "{mismatch}"
+            );
+            assert_eq!(repo.exists("squash"), mismatch != "none");
+            for name in ["squash-used", "master", "production", "main"] {
+                assert!(repo.exists(name));
+            }
+        }
+    }
 
     fn shell_quote(path: &Path) -> String {
         format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
@@ -926,6 +1157,176 @@ mod unix {
                 .lines()
                 .any(|call| matches!(call, "fetch" | "pull" | "push"))
         );
+    }
+
+    #[test]
+    fn squash_detection_errors_stop_before_any_deletion() {
+        for condition in [
+            "[ \"$1\" = rev-parse ] && [ \"${2:-}\" = --revs-only ]",
+            "[ \"$1\" = rev-parse ] && case \"${4:-}\" in *'^{tree}') true ;; *) false ;; esac",
+            "[ \"$1\" = diff-tree ]",
+        ] {
+            let repo = Repo::new();
+            repo.git(&["branch", "a-merged"]);
+            repo.git(&["switch", "-c", "squash"]);
+            fs::write(repo.work.join("feature"), "feature\n").unwrap();
+            repo.git(&["add", "."]);
+            repo.git(&["commit", "-m", "feature"]);
+            repo.git(&["switch", "main"]);
+            repo.git(&["merge", "--squash", "squash"]);
+            repo.git(&["commit", "-m", "squash merge"]);
+            repo.git(&["push", "origin", "main"]);
+            let hook = format!("if {condition}; then exit 91; fi");
+            let output = shim(&repo, &hook).output().unwrap();
+            assert_eq!(output.status.code(), Some(1));
+            assert!(output.stdout.is_empty());
+            assert!(repo.exists("a-merged"));
+            assert!(repo.exists("squash"));
+        }
+    }
+
+    #[test]
+    fn squash_batches_large_diffs_and_shared_trees_without_changing_eligibility() {
+        let repo = Repo::with_format("sha256");
+        let base = repo.git(&["rev-parse", "HEAD"]);
+        let empty_tree = repo.git(&["rev-parse", "HEAD^{tree}"]);
+        let blob = repo.git_input(&["hash-object", "-w", "--stdin"], b"feature\n");
+        let other_blob = repo.git_input(&["hash-object", "-w", "--stdin"], b"unmerged\n");
+        let paths: Vec<_> = (0..1000)
+            .map(|i| {
+                if i == 5 {
+                    format!("line\n{empty_tree} {empty_tree}\tfile")
+                } else {
+                    format!("file-{i:04}")
+                }
+            })
+            .collect();
+        let rows: String = paths
+            .iter()
+            .map(|path| format!("100644 blob {blob}\t{path}\0"))
+            .collect();
+        let target_tree = repo.git_input(&["mktree", "-z"], rows.as_bytes());
+        let target = repo.git(&[
+            "commit-tree",
+            &target_tree,
+            "-p",
+            &base,
+            "-m",
+            "squash integrations",
+        ]);
+        let mut refs = format!("update refs/heads/main {target}\n");
+        let mut expected = vec!["candidate: alias-000".to_owned()];
+        for (i, path) in paths.iter().take(130).enumerate() {
+            let content = if i == 17 { &other_blob } else { &blob };
+            let tree = repo.git_input(
+                &["mktree", "-z"],
+                format!("100644 blob {content}\t{path}\0").as_bytes(),
+            );
+            let tip = repo.git(&[
+                "commit-tree",
+                &tree,
+                "-p",
+                &base,
+                "-m",
+                &format!("topic {i}"),
+            ]);
+            refs.push_str(&format!("create refs/heads/topic-{i:03} {tip}\n"));
+            if i == 0 {
+                refs.push_str(&format!("create refs/heads/alias-000 {tip}\n"));
+            }
+            if i != 17 {
+                expected.push(format!("candidate: topic-{i:03}"));
+            }
+        }
+        let empty = repo.git(&[
+            "commit-tree",
+            &empty_tree,
+            "-p",
+            &base,
+            "-m",
+            "no net change",
+        ]);
+        let unrelated = repo.git(&["commit-tree", &target_tree, "-m", "unrelated root"]);
+        refs.push_str(&format!(
+            "create refs/heads/empty {empty}\ncreate refs/heads/unrelated {unrelated}\n"
+        ));
+        repo.git_input(&["update-ref", "--stdin"], refs.as_bytes());
+        repo.git(&["reset", "--hard", "main"]);
+        repo.git(&["push", "origin", "main"]);
+        let before = repo.git(&["show-ref"]);
+        let output = shim(&repo, "").arg("--dry-run").output().unwrap();
+        assert_success(&output);
+        assert_eq!(text(&output.stdout), expected.join("\n"));
+        assert_eq!(repo.git(&["show-ref"]), before);
+        assert!(!repo.work.join(".git/FETCH_HEAD").exists());
+        let calls = fs::read_to_string(repo.root.join("calls")).unwrap();
+        assert_eq!(calls.lines().filter(|call| *call == "rev-parse").count(), 5);
+        assert_eq!(calls.lines().filter(|call| *call == "diff-tree").count(), 2);
+        assert_eq!(calls.lines().filter(|call| *call == "ls-remote").count(), 1);
+        assert!(
+            !calls
+                .lines()
+                .any(|call| matches!(call, "merge-base" | "fetch" | "pull" | "push"))
+        );
+    }
+
+    #[test]
+    fn malformed_batch_responses_stop_before_any_deletion() {
+        for condition in [
+            "[ \"$1\" = rev-parse ] && [ \"${2:-}\" = --revs-only ]",
+            "[ \"$1\" = rev-parse ] && case \"${4:-}\" in *'^{tree}') true ;; *) false ;; esac",
+            "[ \"$1\" = diff-tree ]",
+        ] {
+            let repo = Repo::new();
+            repo.git(&["branch", "a-merged"]);
+            repo.git(&["switch", "-c", "squash"]);
+            fs::write(repo.work.join("feature"), "feature\n").unwrap();
+            repo.git(&["add", "."]);
+            repo.git(&["commit", "-m", "feature"]);
+            repo.git(&["switch", "main"]);
+            repo.git(&["merge", "--squash", "squash"]);
+            repo.git(&["commit", "-m", "squash merge"]);
+            repo.git(&["push", "origin", "main"]);
+            let hook = format!(
+                "if {condition}; then\nif [ \"$1\" = diff-tree ]; then cat > /dev/null; fi\nprintf 'invalid\\n'; exit 0; fi"
+            );
+            let output = shim(&repo, &hook).output().unwrap();
+            assert_eq!(output.status.code(), Some(1));
+            assert!(output.stdout.is_empty());
+            assert!(repo.exists("a-merged"));
+            assert!(repo.exists("squash"));
+        }
+    }
+
+    #[test]
+    fn squash_rechecks_tips_and_worktree_use_before_deletion() {
+        for change in ["tip", "worktree"] {
+            let repo = Repo::new();
+            repo.git(&["switch", "-c", "squash"]);
+            fs::write(repo.work.join("feature"), "feature\n").unwrap();
+            repo.git(&["add", "."]);
+            repo.git(&["commit", "-m", "feature"]);
+            let old = repo.git(&["rev-parse", "HEAD"]);
+            repo.git(&["switch", "main"]);
+            repo.git(&["merge", "--squash", "squash"]);
+            repo.git(&["commit", "-m", "squash merge"]);
+            repo.git(&["push", "origin", "main"]);
+            let mutation = if change == "tip" {
+                format!("\"$real_git\" update-ref refs/heads/squash main {old}")
+            } else {
+                format!(
+                    "\"$real_git\" worktree add -q {} squash",
+                    shell_quote(&repo.root.join("late-worktree"))
+                )
+            };
+            let hook = format!(
+                "if [ \"$1\" = for-each-ref ] && [ \"${{4:-}}\" = refs/heads/squash ]; then\n{mutation}\nfi"
+            );
+            let output = shim(&repo, &hook).output().unwrap();
+            assert_success(&output);
+            assert_eq!(text(&output.stdout), "deleted: 0");
+            assert!(repo.exists("squash"));
+        }
     }
 
     #[test]

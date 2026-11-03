@@ -12,6 +12,12 @@ Git の認証、credential helper、SSH 設定、worktree 保護、ブランチ�
 
 不足オブジェクトの自動取得を防ぐため、Git に `--no-lazy-fetch` を指定します。対応していない Git は処理開始時に失敗します。ローカルの replacement object でマージ判定が変わらないように、`GIT_NO_REPLACE_OBJECTS=1` も指定します。
 
+履歴上マージ済みでないブランチは、`git rev-parse --revs-only` に `先端OID...既定ブランチOID` をまとめて渡して共通祖先を確認します。[Git の三点記法](https://git-scm.com/docs/gitrevisions#_the_three_dot_symmetric_difference_notation)は `git merge-base --all` の全共通祖先を除外する展開で、共通祖先の計算自体は Git に任せます。先端 OID の重複を除き、128件ずつ処理して引数長を制限します。応答は要求した2つの OID と除外された共通祖先の組として検査します。
+
+一意の共通祖先からブランチ先端への変更が空でなく、その全パスの変更が既定ブランチへの変更と一致する場合に候補へ加えます。コミットからツリー ID をまとめて取得し、`git diff-tree --stdin --raw -r -z --no-abbrev --no-renames` で複数のツリーペアを比較します。同じペアはバッチ内で一度だけ比較し、各応答のペア ID・NUL 区切りレコード・応答数を検査します。比較結果の再利用は実行中の固定 OID に限定し、128先端ごとに結果を破棄します。次回実行への参照情報のキャッシュはありません。
+
+完全なオブジェクト ID と権限を比較し、パッチの類似性は使いません。名前変更は削除と追加の両方が一致する必要があります。相対パス表示・外部 diff・textconv・submodule 差分の無視は明示的に無効にし、作業ツリーや index には触れません。[Git の raw 差分形式](https://git-scm.com/docs/git-diff-tree#_raw_output_format)に基づき、パスは NUL 区切りのバイト列として扱います。共通祖先やツリー差分の判定はすべて削除開始前に完了させ、各ブランチの先端と worktree 使用状態の再確認は操作直前に行います。
+
 問い合わせの集約と SSH 接続の再利用は別の改善として扱います。性能検証では、接続がない初回と接続を再利用できる実行を分け、同じリポジトリ・候補条件で比較します。Rust 化だけで通信待ちがなくなるとは扱いません。実測値と条件は [速度検証](performance.md)に記載しています。
 
 ## SSH 接続
