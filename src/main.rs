@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -30,7 +30,8 @@ const BRANCHES_HELP: &str = "giclean br — Delete merged local branches
 Usage: giclean br [--dry-run]
 
 Delete local branches merged into origin's latest default branch.
-Includes squash merges when all changed paths match in content and permissions.
+Includes squash changes when all changed paths match in content and permissions
+at one point in the default branch's first-parent history.
 
 Options:
   --dry-run   Show deletion candidates only
@@ -215,6 +216,26 @@ fn tree_changes(
     Ok(results)
 }
 
+fn reachable_objects(target: &str, progress: &Progress) -> Result<HashSet<String>, String> {
+    let output = git_text(
+        &["rev-list", "--objects", "--no-object-names", target, "--"],
+        progress,
+    )?;
+    let mut lines = output.lines().peekable();
+    if lines.peek().copied() != Some(target) {
+        return Err("cannot parse reachable object IDs".into());
+    }
+    lines
+        .map(|oid| {
+            if valid_oid(oid) {
+                Ok(oid.to_owned())
+            } else {
+                Err("cannot parse reachable object IDs".into())
+            }
+        })
+        .collect()
+}
+
 fn squash_included(
     tips: &[&str],
     target: &str,
@@ -279,6 +300,7 @@ fn squash_included(
         );
     }
     let mut included = BTreeSet::new();
+    let mut reachable = None;
     let branches: Vec<_> = bases.iter().collect();
     for chunk in branches.chunks(BATCH_SIZE) {
         let pairs: BTreeSet<_> = chunk
@@ -295,7 +317,7 @@ fn squash_included(
                 ]
             })
             .collect();
-        let diffs = if pairs.is_empty() {
+        let mut diffs = if pairs.is_empty() {
             BTreeMap::new()
         } else {
             tree_changes(&pairs, progress)?
@@ -320,6 +342,131 @@ fn squash_included(
                     .all(|(path, change)| target_changes.get(path) == Some(change))
             {
                 included.insert((*tip).clone());
+            }
+        }
+        // Reuse this batch's branch diffs; do not walk the same trees again.
+        let mut pending = BTreeMap::<&str, Vec<&str>>::new();
+        for (tip, base) in chunk {
+            if !included.contains(*tip) && trees[tip.as_str()] != trees[base.as_str()] {
+                pending.entry(base.as_str()).or_default().push(tip.as_str());
+            }
+        }
+        for (base, mut tips) in pending {
+            let range = format!("{base}..{target}");
+            let output = git_text(
+                &[
+                    "rev-list",
+                    "--format=%T",
+                    "--no-commit-header",
+                    "--first-parent",
+                    "--ancestry-path",
+                    &range,
+                    "--",
+                ],
+                progress,
+            )?;
+            let mut history = BTreeSet::new();
+            let mut oldest = None;
+            for tree in output.lines() {
+                if !valid_oid(tree) {
+                    return Err("cannot parse historical tree IDs".into());
+                }
+                oldest = Some(tree);
+                if tree != trees[target] && tree != trees[base] {
+                    history.insert(tree.to_owned());
+                }
+            }
+            if history.is_empty() {
+                continue;
+            }
+            if trees[base] == trees[target] {
+                // The latest-tree shortcut did not need these branch diffs.
+                let pairs = tips
+                    .iter()
+                    .map(|tip| (trees[base].clone(), trees[*tip].clone()))
+                    .collect();
+                diffs.extend(tree_changes(&pairs, progress)?);
+            }
+            if history.len() > BATCH_SIZE {
+                // Try the oldest eligible state before comparing a large batch.
+                // This often finds integrations followed by unrelated changes.
+                if let Some(tree) = oldest.filter(|tree| history.contains(*tree)) {
+                    let pair = (trees[base].clone(), tree.to_owned());
+                    let snapshots = tree_changes(&BTreeSet::from([pair.clone()]), progress)?;
+                    let snapshot = &snapshots[&pair];
+                    for tip in &tips {
+                        let changes = &diffs[&(trees[base].clone(), trees[*tip].clone())];
+                        if !changes.is_empty()
+                            && changes
+                                .iter()
+                                .all(|(path, change)| snapshot.get(path) == Some(change))
+                        {
+                            included.insert((*tip).to_owned());
+                        }
+                    }
+                    history.remove(tree);
+                    tips.retain(|tip| !included.contains(*tip));
+                    if tips.is_empty() {
+                        continue;
+                    }
+                }
+                // A matching snapshot must reference each non-deleted blob.
+                // Enumerate the target's entire reachable history (a superset
+                // of eligible snapshots) once. Absence can only rule a tip out;
+                // presence never proves inclusion. Gitlinks are not traversed
+                // by rev-list --objects, so their OIDs must not be required.
+                let mut required = BTreeMap::new();
+                for tip in &tips {
+                    let changes = &diffs[&(trees[base].clone(), trees[*tip].clone())];
+                    let mut objects = BTreeSet::new();
+                    for change in changes.values() {
+                        let fields: Vec<_> = change.split(|byte| *byte == b' ').collect();
+                        if fields.len() != 5 {
+                            return Err("cannot parse tree changes".into());
+                        }
+                        if !matches!(fields[1], b"000000" | b"160000") {
+                            let oid = std::str::from_utf8(fields[3])
+                                .ok()
+                                .filter(|oid| valid_oid(oid))
+                                .ok_or("cannot parse tree changes")?;
+                            objects.insert(oid);
+                        }
+                    }
+                    required.insert(*tip, objects);
+                }
+                if required.values().any(|objects| !objects.is_empty()) {
+                    if reachable.is_none() {
+                        reachable = Some(reachable_objects(target, progress)?);
+                    }
+                    let reachable = reachable.as_ref().unwrap();
+                    tips.retain(|tip| required[tip].iter().all(|oid| reachable.contains(*oid)));
+                    if tips.is_empty() {
+                        continue;
+                    }
+                }
+            }
+            let history: Vec<_> = history.into_iter().collect();
+            for snapshots in history.chunks(BATCH_SIZE) {
+                let pairs = snapshots
+                    .iter()
+                    .map(|tree| (trees[base].clone(), tree.clone()))
+                    .collect();
+                let historical_changes = tree_changes(&pairs, progress)?;
+                for tip in &tips {
+                    let changes = &diffs[&(trees[base].clone(), trees[*tip].clone())];
+                    if !changes.is_empty()
+                        && historical_changes.values().any(|snapshot| {
+                            changes
+                                .iter()
+                                .all(|(path, change)| snapshot.get(path) == Some(change))
+                        })
+                    {
+                        included.insert((*tip).to_owned());
+                    }
+                }
+                if tips.iter().all(|tip| included.contains(*tip)) {
+                    break;
+                }
             }
         }
     }
