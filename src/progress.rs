@@ -81,6 +81,18 @@ impl Progress {
         }
     }
 
+    // Git, SSH, and credential helpers can write prompts directly to /dev/tty.
+    // Stop drawing before starting any operation that can ask for input.
+    pub fn pause_for_input(&self) {
+        if let Some(display) = &self.display {
+            let mut display = display.lock().unwrap();
+            if display.visible {
+                display.draw("…", true);
+                display.visible = false;
+            }
+        }
+    }
+
     // Clear the progress line for stdout and child diagnostics.
     // Once another writer uses the terminal, stop redrawing for this stage.
     pub fn suspend(&self) {
@@ -120,7 +132,11 @@ impl Progress {
         command: &mut Command,
         wait: impl FnOnce(Child) -> io::Result<T>,
     ) -> io::Result<T> {
-        if self.display.is_none() {
+        if self
+            .display
+            .as_ref()
+            .is_none_or(|display| !display.lock().unwrap().visible)
+        {
             return wait(command.spawn()?);
         }
         let mut child = command.stderr(Stdio::piped()).spawn()?;

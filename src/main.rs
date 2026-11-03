@@ -250,6 +250,7 @@ fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<(), String> {
         Some("origin の既定ブランチと最新コミットを確認しています..."),
     );
     let origin = git_text(&["remote", "get-url", "origin"], &progress)?;
+    progress.pause_for_input();
     let mut query = git(&["ls-remote", "--symref", "--exit-code", "origin", "HEAD"]);
     ssh::configure(&mut query, origin.trim());
     let remote = parse_remote_head(&git_command_text(query, "ls-remote", &progress)?)?;
