@@ -260,8 +260,53 @@ fn squash_deletion_matches_complete_changes_with_other_default_branch_changes() 
 }
 
 #[test]
-fn squash_preserves_partial_reverted_later_edited_and_extra_tip_changes() {
-    for case in ["partial", "reverted", "later-edit", "extra-tip"] {
+fn squash_deletes_after_later_edits_or_reverts_on_default_branch() {
+    for format in ["sha1", "sha256"] {
+        for case in ["later-edit", "reverted"] {
+            let repo = Repo::with_format(format);
+            repo.git(&["switch", "-c", "squash"]);
+            for path in ["first", "second"] {
+                fs::write(repo.work.join(path), "feature\n").unwrap();
+            }
+            repo.git(&["add", "."]);
+            repo.git(&["commit", "-m", "feature"]);
+            repo.git(&["switch", "main"]);
+            if case == "later-edit" {
+                fs::write(repo.work.join("unrelated"), "independent change\n").unwrap();
+                repo.git(&["add", "."]);
+                repo.git(&["commit", "-m", "independent change before integration"]);
+            }
+            repo.git(&["merge", "--squash", "squash"]);
+            repo.git(&["commit", "-m", "integration"]);
+            if case == "reverted" {
+                repo.git(&["revert", "--no-edit", "HEAD"]);
+            } else {
+                fs::write(repo.work.join("first"), "feature plus later edit\n").unwrap();
+                repo.git(&["add", "."]);
+                repo.git(&["commit", "-m", "later edit"]);
+            }
+            repo.git(&["push", "origin", "main"]);
+            let before = repo.git(&["show-ref"]);
+            let output = repo.run(&["br", "--dry-run"]);
+            assert_success(&output);
+            assert_eq!(
+                text(&output.stdout),
+                "candidate: squash",
+                "{format}: {case}"
+            );
+            assert_eq!(repo.git(&["show-ref"]), before);
+            let output = repo.run(&["br"]);
+            assert_success(&output);
+            assert_eq!(text(&output.stdout), "squash: deleted", "{format}: {case}");
+            assert!(!repo.exists("squash"));
+            assert!(!repo.work.join(".git/FETCH_HEAD").exists());
+        }
+    }
+}
+
+#[test]
+fn squash_preserves_partial_and_extra_tip_changes() {
+    for case in ["partial", "extra-tip", "extra-same-path"] {
         let repo = Repo::new();
         repo.git(&["switch", "-c", "squash"]);
         for path in ["first", "second"] {
@@ -277,23 +322,88 @@ fn squash_preserves_partial_reverted_later_edited_and_extra_tip_changes() {
             repo.git(&["merge", "--squash", "squash"]);
         }
         repo.git(&["commit", "-m", "integration"]);
-        if case == "reverted" {
-            repo.git(&["revert", "--no-edit", "HEAD"]);
-        } else if case == "later-edit" {
+        if case != "partial" {
             fs::write(repo.work.join("first"), "feature plus later edit\n").unwrap();
             repo.git(&["add", "."]);
             repo.git(&["commit", "-m", "later edit"]);
-        } else if case == "extra-tip" {
             repo.git(&["switch", "squash"]);
-            fs::write(repo.work.join("extra"), "unmerged\n").unwrap();
+            let path = if case == "extra-tip" {
+                "extra"
+            } else {
+                "first"
+            };
+            fs::write(repo.work.join(path), "unmerged\n").unwrap();
             repo.git(&["add", "."]);
             repo.git(&["commit", "-m", "unmerged follow-up"]);
             repo.git(&["switch", "main"]);
         }
         repo.git(&["push", "origin", "main"]);
+        let before = repo.git(&["show-ref"]);
+        let output = repo.run(&["br", "--dry-run"]);
+        assert_success(&output);
+        assert_eq!(text(&output.stdout), "", "{case}");
+        assert_eq!(repo.git(&["show-ref"]), before);
         let output = repo.run(&["br"]);
         assert_success(&output);
         assert_eq!(text(&output.stdout), "", "{case}");
+        assert!(repo.exists("squash"));
+    }
+}
+
+#[test]
+fn historical_squash_requires_all_paths_to_match_at_the_same_commit() {
+    let repo = Repo::new();
+    repo.git(&["switch", "-c", "squash"]);
+    for path in ["first", "second"] {
+        fs::write(repo.work.join(path), "feature\n").unwrap();
+    }
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "feature"]);
+    repo.git(&["switch", "main"]);
+    fs::write(repo.work.join("first"), "feature\n").unwrap();
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "first path only"]);
+    fs::write(repo.work.join("first"), "different\n").unwrap();
+    fs::write(repo.work.join("second"), "feature\n").unwrap();
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "second path only"]);
+    repo.git(&["push", "origin", "main"]);
+    for args in [&["br", "--dry-run"][..], &["br"][..]] {
+        let output = repo.run(args);
+        assert_success(&output);
+        assert!(output.stdout.is_empty());
+        assert!(repo.exists("squash"));
+    }
+}
+
+#[test]
+fn historical_squash_ignores_side_branch_snapshots_discarded_by_a_merge() {
+    let repo = Repo::new();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+    let base_tree = repo.git(&["rev-parse", "HEAD^{tree}"]);
+    repo.git(&["switch", "-c", "squash"]);
+    fs::write(repo.work.join("feature"), "feature\n").unwrap();
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "feature"]);
+    let tree = repo.git(&["rev-parse", "HEAD^{tree}"]);
+    let side = repo.git(&["commit-tree", &tree, "-p", &base, "-m", "side integration"]);
+    let target = repo.git(&[
+        "commit-tree",
+        &base_tree,
+        "-p",
+        &base,
+        "-p",
+        &side,
+        "-m",
+        "discard side changes",
+    ]);
+    repo.git(&["switch", "main"]);
+    repo.git(&["reset", "--hard", &target]);
+    repo.git(&["push", "origin", "main"]);
+    for args in [&["br", "--dry-run"][..], &["br"][..]] {
+        let output = repo.run(args);
+        assert_success(&output);
+        assert!(output.stdout.is_empty());
         assert!(repo.exists("squash"));
     }
 }
@@ -676,6 +786,296 @@ mod unix {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn historical_search_preserves_a_match_when_the_base_is_a_second_parent() {
+        let repo = Repo::with_format("sha256");
+        let root = repo.git(&["rev-parse", "HEAD"]);
+        let empty_tree = repo.git(&["rev-parse", "HEAD^{tree}"]);
+        let feature = repo.git_input(&["hash-object", "-w", "--stdin"], b"feature\n");
+        let later = repo.git_input(&["hash-object", "-w", "--stdin"], b"later edit\n");
+        let tree = repo.git_input(
+            &["mktree"],
+            format!("100644 blob {feature}\tfeature\n").as_bytes(),
+        );
+        let first = repo.git(&[
+            "commit-tree",
+            &tree,
+            "-p",
+            &root,
+            "-m",
+            "first-parent feature",
+        ]);
+        let base = repo.git(&["commit-tree", &empty_tree, "-p", &root, "-m", "side base"]);
+        let tip = repo.git(&["commit-tree", &tree, "-p", &base, "-m", "topic"]);
+        let mut parent = repo.git(&[
+            "commit-tree",
+            &tree,
+            "-p",
+            &first,
+            "-p",
+            &base,
+            "-m",
+            "merge side base",
+        ]);
+        // The only matching eligible snapshot is the merge itself. Its paths
+        // equal its first parent's, so a path-limited walk would omit it.
+        for i in 0..130 {
+            let blob = repo.git_input(
+                &["hash-object", "-w", "--stdin"],
+                format!("{i}\n").as_bytes(),
+            );
+            let tree = repo.git_input(
+                &["mktree"],
+                format!("100644 blob {later}\tfeature\n100644 blob {blob}\tunrelated\n").as_bytes(),
+            );
+            parent = repo.git(&["commit-tree", &tree, "-p", &parent, "-m", "later change"]);
+        }
+        repo.git_input(
+            &["update-ref", "--stdin"],
+            format!("update refs/heads/main {parent}\ncreate refs/heads/topic {tip}\n").as_bytes(),
+        );
+        repo.git(&["reset", "--hard", "main"]);
+        repo.git(&["push", "origin", "main"]);
+        let before = repo.git(&["show-ref"]);
+        let output = repo.run(&["br", "--dry-run"]);
+        assert_success(&output);
+        assert_eq!(text(&output.stdout), "candidate: topic");
+        assert_eq!(repo.git(&["show-ref"]), before);
+        let output = repo.run(&["br"]);
+        assert_success(&output);
+        assert_eq!(text(&output.stdout), "topic: deleted");
+        assert!(!repo.exists("topic"));
+        assert!(!repo.work.join(".git/FETCH_HEAD").exists());
+    }
+
+    #[test]
+    fn historical_object_filter_handles_literal_bytes_subdirectories_and_query_errors() {
+        let repo = Repo::new();
+        let base = repo.git(&["rev-parse", "HEAD"]);
+        // Construct invalid UTF-8 names in tree objects: macOS cannot create
+        // these names in the filesystem, but Git must still compare their bytes.
+        let feature = repo.git_input(&["hash-object", "-w", "--stdin"], b"feature\n");
+        let later = repo.git_input(&["hash-object", "-w", "--stdin"], b"later edit\n");
+        let unrelated = repo.git_input(&["hash-object", "-w", "--stdin"], b"initial\n");
+        let name = b":(glob)*[x]\twith\n\xff";
+        let nested_feature = repo.git_input(
+            &["mktree", "-z"],
+            &[format!("100644 blob {feature}\t").as_bytes(), name, b"\0"].concat(),
+        );
+        let nested = repo.git_input(
+            &["mktree", "-z"],
+            &[format!("100644 blob {later}\t").as_bytes(), name, b"\0"].concat(),
+        );
+        let tree = repo.git_input(
+            &["mktree"],
+            format!("040000 tree {nested_feature}\tnested\n").as_bytes(),
+        );
+        let tip = repo.git(&["commit-tree", &tree, "-p", &base, "-m", "feature"]);
+        let tree = repo.git_input(
+            &["mktree"],
+            format!("100644 blob {unrelated}\tunrelated\n").as_bytes(),
+        );
+        let parent = repo.git(&[
+            "commit-tree",
+            &tree,
+            "-p",
+            &base,
+            "-m",
+            "independent change",
+        ]);
+        let tree = repo.git_input(
+            &["mktree"],
+            format!("040000 tree {nested_feature}\tnested\n100644 blob {unrelated}\tunrelated\n")
+                .as_bytes(),
+        );
+        let parent = repo.git(&["commit-tree", &tree, "-p", &parent, "-m", "integration"]);
+        let tree = repo.git_input(
+            &["mktree"],
+            format!("040000 tree {nested}\tnested\n100644 blob {unrelated}\tunrelated\n")
+                .as_bytes(),
+        );
+        let mut parent = repo.git(&["commit-tree", &tree, "-p", &parent, "-m", "later edit"]);
+        repo.git(&["switch", "--detach", &base]);
+        repo.git(&["update-ref", "refs/heads/squash", &tip]);
+        fs::create_dir(repo.work.join("nested")).unwrap();
+        for i in 0..130 {
+            let blob = repo.git_input(
+                &["hash-object", "-w", "--stdin"],
+                format!("{i}\n").as_bytes(),
+            );
+            let tree = repo.git_input(
+                &["mktree"],
+                format!("040000 tree {nested}\tnested\n100644 blob {blob}\tunrelated\n").as_bytes(),
+            );
+            parent = repo.git(&[
+                "commit-tree",
+                &tree,
+                "-p",
+                &parent,
+                "-m",
+                "unrelated change",
+            ]);
+        }
+        repo.git(&["update-ref", "refs/heads/main", &parent]);
+        repo.git(&["push", "origin", "main"]);
+        let history_output = repo.root.join("history-output");
+        let hook = format!(
+            "if [ \"$1\" = rev-list ]; then\ncase \" $* \" in *' --objects '*)\ncase \"${{TEST_HISTORY_FAILURE:-}}\" in\nexit) exit 91 ;;\nmalformed) printf 'invalid\\n'; exit 0 ;;\nforeign) printf 'commit {}\\n{}\\n'; exit 0 ;;\nesac ;;\nesac\n\"$real_git\" --no-lazy-fetch \"$@\" > {}\ncat {}; exit 0\nfi",
+            "a".repeat(40),
+            "b".repeat(40),
+            shell_quote(&history_output),
+            shell_quote(&history_output),
+        );
+        let mut command = shim(&repo, &hook);
+        command
+            .arg("--dry-run")
+            .current_dir(repo.work.join("nested"));
+        for key in [
+            "GIT_LITERAL_PATHSPECS",
+            "GIT_GLOB_PATHSPECS",
+            "GIT_NOGLOB_PATHSPECS",
+            "GIT_ICASE_PATHSPECS",
+        ] {
+            let before = repo.git(&["show-ref"]);
+            let output = command.env(key, "1").output().unwrap();
+            command.env_remove(key);
+            assert_success(&output);
+            assert_eq!(text(&output.stdout), "candidate: squash", "{key}");
+            assert_eq!(repo.git(&["show-ref"]), before);
+            let history = fs::read_to_string(&history_output).unwrap();
+            assert_eq!(history.lines().next(), Some(parent.as_str()));
+        }
+        let calls_path = repo.root.join("calls");
+        let calls = fs::read_to_string(&calls_path).unwrap();
+        assert_eq!(calls.lines().filter(|call| *call == "rev-list").count(), 8);
+        repo.git(&["branch", "a-merged", &base]);
+        for failure in ["exit", "malformed", "foreign"] {
+            let before = repo.git(&["show-ref"]);
+            let output = command
+                .env("TEST_HISTORY_FAILURE", failure)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(1), "{failure}");
+            assert!(output.stdout.is_empty());
+            assert_eq!(repo.git(&["show-ref"]), before);
+        }
+        command.env_remove("TEST_HISTORY_FAILURE");
+        repo.git(&["branch", "-d", "a-merged"]);
+        // Absent objects rule out all of these added paths, without affecting
+        // the eligible branch whose blob exists in the target's history.
+        let blob = repo.git_input(&["hash-object", "-w", "--stdin"], b"unmerged\n");
+        let rows: String = (0..1000)
+            .map(|i| format!("100644 blob {blob}\tlong-unmerged-path-{i:04}\n"))
+            .collect();
+        let tree = repo.git_input(&["mktree"], rows.as_bytes());
+        let tip = repo.git(&[
+            "commit-tree",
+            &tree,
+            "-p",
+            &base,
+            "-m",
+            "many unmerged paths",
+        ]);
+        repo.git(&["update-ref", "refs/heads/wide", &tip]);
+        fs::write(&calls_path, "").unwrap();
+        let output = command.output().unwrap();
+        assert_success(&output);
+        assert_eq!(text(&output.stdout), "candidate: squash");
+        let calls = fs::read_to_string(&calls_path).unwrap();
+        assert_eq!(calls.lines().filter(|call| *call == "rev-list").count(), 2);
+        let output = repo.run(&["br"]);
+        assert_success(&output);
+        assert_eq!(text(&output.stdout), "squash: deleted");
+        assert!(repo.exists("wide"));
+        assert!(!repo.work.join(".git/FETCH_HEAD").exists());
+    }
+
+    #[test]
+    fn historical_object_filter_preserves_modes_deletions_and_missing_gitlink_objects() {
+        let repo = Repo::with_format("sha256");
+        let root = repo.git(&["rev-parse", "HEAD"]);
+        let blob = repo.git_input(&["hash-object", "-w", "--stdin"], b"base\n");
+        let absent = repo.git_input(&["hash-object", "-w", "--stdin"], b"unmerged\n");
+        let gitlink = "a".repeat(64);
+        let later_gitlink = "b".repeat(64);
+        let rows = format!("100644 blob {blob}\tdeleted\n100644 blob {blob}\tscript\n");
+        let tree = repo.git_input(&["mktree"], rows.as_bytes());
+        let base = repo.git(&["commit-tree", &tree, "-p", &root, "-m", "base files"]);
+        for (name, rows) in [
+            ("deleted", format!("100644 blob {blob}\tscript\n")),
+            (
+                "mode",
+                format!("100644 blob {blob}\tdeleted\n100755 blob {blob}\tscript\n"),
+            ),
+            (
+                "gitlink",
+                format!("{rows}160000 commit {gitlink}\tmodule\n"),
+            ),
+            (
+                "wrong-path",
+                format!("{rows}100644 blob {blob}\twrong-path\n"),
+            ),
+            (
+                "unmerged",
+                format!("{rows}100644 blob {absent}\tunmerged\n"),
+            ),
+        ] {
+            let tree = repo.git_input(&["mktree"], rows.as_bytes());
+            let tip = repo.git(&["commit-tree", &tree, "-p", &base, "-m", name]);
+            repo.git(&["update-ref", &format!("refs/heads/{name}"), &tip]);
+        }
+        let tree = repo.git_input(
+            &["mktree"],
+            format!("{rows}100644 blob {blob}\tunrelated\n").as_bytes(),
+        );
+        let parent = repo.git(&["commit-tree", &tree, "-p", &base, "-m", "unrelated first"]);
+        let tree = repo.git_input(
+            &["mktree"],
+            format!("160000 commit {gitlink}\tmodule\n100755 blob {blob}\tscript\n100644 blob {blob}\tunrelated\n").as_bytes(),
+        );
+        let mut parent = repo.git(&["commit-tree", &tree, "-p", &parent, "-m", "integration"]);
+        for i in 0..130 {
+            let history_blob = repo.git_input(
+                &["hash-object", "-w", "--stdin"],
+                format!("{i}\n").as_bytes(),
+            );
+            let tree = repo.git_input(
+                &["mktree"],
+                format!("{rows}160000 commit {later_gitlink}\tmodule\n100644 blob {history_blob}\tunrelated\n").as_bytes(),
+            );
+            parent = repo.git(&["commit-tree", &tree, "-p", &parent, "-m", "later changes"]);
+        }
+        repo.git(&["switch", "--detach", &root]);
+        repo.git(&["update-ref", "refs/heads/main", &parent]);
+        repo.git(&["push", "origin", "main"]);
+        repo.git(&["config", "diff.ignoreSubmodules", "all"]);
+        let reachable = repo.git(&["rev-list", "--objects", "--no-object-names", "main"]);
+        assert!(
+            !reachable
+                .lines()
+                .any(|oid| oid == gitlink || oid == later_gitlink || oid == absent)
+        );
+        let before = repo.git(&["show-ref"]);
+        let output = shim(&repo, "").arg("--dry-run").output().unwrap();
+        assert_success(&output);
+        assert_eq!(
+            text(&output.stdout),
+            "candidate: deleted\ncandidate: gitlink\ncandidate: mode"
+        );
+        assert_eq!(repo.git(&["show-ref"]), before);
+        let calls = fs::read_to_string(repo.root.join("calls")).unwrap();
+        assert_eq!(calls.lines().filter(|call| *call == "rev-list").count(), 2);
+        let output = repo.run(&["br"]);
+        assert_success(&output);
+        assert_eq!(
+            text(&output.stdout),
+            "deleted: deleted\ngitlink: deleted\nmode: deleted"
+        );
+        assert!(repo.exists("wrong-path"));
+        assert!(repo.exists("unmerged"));
+        assert!(!repo.work.join(".git/FETCH_HEAD").exists());
+    }
+
+    #[test]
     fn squash_checks_modes_symlinks_and_gitlinks_and_keeps_protected_branches() {
         for mismatch in ["none", "mode", "symlink", "gitlink"] {
             let repo = Repo::new();
@@ -702,7 +1102,6 @@ mod unix {
             repo.git(&["switch", "main"]);
             repo.add_worktree("squash-used", "used");
             repo.git(&["merge", "--squash", "squash"]);
-            repo.git(&["commit", "-m", "squash merge"]);
             match mismatch {
                 "mode" => {
                     repo.git(&["update-index", "--chmod=-x", "script"]);
@@ -721,9 +1120,9 @@ mod unix {
                 }
                 _ => {}
             }
-            if mismatch != "none" {
-                repo.git(&["commit", "-m", "different metadata"]);
-            }
+            // A mismatch must exist at integration time: a later metadata edit
+            // would now qualify through the earlier matching snapshot.
+            repo.git(&["commit", "-m", "integration with selected metadata"]);
             repo.git(&["push", "origin", "main"]);
             // A user setting must not hide submodule differences.
             repo.git(&["config", "diff.ignoreSubmodules", "all"]);
@@ -1590,6 +1989,43 @@ mod unix {
             assert!(output.stdout.is_empty());
             assert!(repo.exists("a-merged"));
             assert!(repo.exists("squash"));
+        }
+    }
+
+    #[test]
+    fn historical_squash_errors_stop_before_any_deletion() {
+        for failure in ["query", "query-response", "diff", "diff-response"] {
+            let repo = Repo::new();
+            repo.git(&["branch", "a-merged"]);
+            repo.git(&["switch", "-c", "squash"]);
+            fs::write(repo.work.join("feature"), "feature\n").unwrap();
+            repo.git(&["add", "."]);
+            repo.git(&["commit", "-m", "feature"]);
+            repo.git(&["switch", "main"]);
+            repo.git(&["merge", "--squash", "squash"]);
+            repo.git(&["commit", "-m", "integration"]);
+            fs::write(repo.work.join("feature"), "later edit\n").unwrap();
+            repo.git(&["add", "."]);
+            repo.git(&["commit", "-m", "later edit"]);
+            repo.git(&["push", "origin", "main"]);
+            let hook = match failure {
+                "query" => "if [ \"$1\" = rev-list ]; then exit 91; fi",
+                "query-response" => {
+                    "if [ \"$1\" = rev-list ]; then printf 'invalid\\n'; exit 0; fi"
+                }
+                "diff" => {
+                    "if [ \"$1\" = rev-list ]; then touch ../history-queried; fi\nif [ \"$1\" = diff-tree ] && [ -f ../history-queried ]; then exit 91; fi"
+                }
+                _ => {
+                    "if [ \"$1\" = rev-list ]; then touch ../history-queried; fi\nif [ \"$1\" = diff-tree ] && [ -f ../history-queried ]; then cat > /dev/null; printf 'invalid\\n'; exit 0; fi"
+                }
+            };
+            let before = repo.git(&["show-ref"]);
+            let output = shim(&repo, hook).output().unwrap();
+            assert_eq!(output.status.code(), Some(1), "{failure}");
+            assert!(output.stdout.is_empty(), "{failure}");
+            assert_eq!(repo.git(&["show-ref"]), before, "{failure}");
+            assert!(!repo.work.join(".git/FETCH_HEAD").exists());
         }
     }
 
