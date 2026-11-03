@@ -6,6 +6,8 @@ Rust の標準ライブラリから Git コマンドを引数配列で起動し�
 
 Git の認証、credential helper、SSH 設定、worktree 保護、ブランチ設定の削除を既存の Git に任せるため、`git2` / `gix` は採用していません。Rust の外部クレートや GitHub CLI、GitHub API トークンは不要です。
 
+macOS で PATH 上の Git が `/usr/bin/git` の場合だけ、`xcrun --find git` で同じ開発ツール設定が選ぶ Git 本体を実行中に一度解決します。ブランチごとの検査・削除で Apple の起動用プログラムを繰り返し通る時間を省きます。PATH 上で別の Git やラッパーが先に選ばれる場合はその指定を維持し、解決に失敗した場合も通常の `git` 起動に戻ります。Linux の起動方法は変更しません。
+
 ## リモート照会と履歴判定
 
 `br` は `git ls-remote --symref --exit-code origin HEAD` で既定ブランチ名と最新コミット ID をまとめて取得します。元の `gitcleanbr` の `gh repo view` と `git ls-remote` の二段階を、Git のリモート照会一回にしています。[Git の `--symref` 仕様](https://git-scm.com/docs/git-ls-remote#Documentation/git-ls-remote.txt---symref)に基づく構成です。
@@ -15,6 +17,8 @@ Git の認証、credential helper、SSH 設定、worktree 保護、ブランチ�
 履歴上マージ済みでないブランチは、`git rev-parse --revs-only` に `先端OID...既定ブランチOID` をまとめて渡して共通祖先を確認します。[Git の三点記法](https://git-scm.com/docs/gitrevisions#_the_three_dot_symmetric_difference_notation)は `git merge-base --all` の全共通祖先を除外する展開で、共通祖先の計算自体は Git に任せます。先端 OID の重複を除き、128件ずつ処理して引数長を制限します。応答は要求した2つの OID と除外された共通祖先の組として検査します。
 
 一意の共通祖先からブランチ先端への変更が空でなく、その全パスの変更が既定ブランチへの変更と一致する場合に候補へ加えます。コミットからツリー ID をまとめて取得し、`git diff-tree --stdin --raw -r -z --no-abbrev --no-renames` で複数のツリーペアを比較します。同じペアはバッチ内で一度だけ比較し、各応答のペア ID・NUL 区切りレコード・応答数を検査します。比較結果の再利用は実行中の固定 OID に限定し、128先端ごとに結果を破棄します。次回実行への参照情報のキャッシュはありません。
+
+ツリー ID だけで判定できる場合は差分を作りません。共通祖先と先端が同一ツリーなら正味の変更がないため保持し、共通祖先と既定ブランチが同一ツリーなら未取り込みとして保持します。どちらにも該当せず、先端と既定ブランチが同一ツリーなら変更全体が一致するため候補へ加えます。共通祖先の確認と操作直前の先端・worktree 使用状態の再確認は、この場合も行います。
 
 完全なオブジェクト ID と権限を比較し、パッチの類似性は使いません。名前変更は削除と追加の両方が一致する必要があります。相対パス表示・外部 diff・textconv・submodule 差分の無視は明示的に無効にし、作業ツリーや index には触れません。[Git の raw 差分形式](https://git-scm.com/docs/git-diff-tree#_raw_output_format)に基づき、パスは NUL 区切りのバイト列として扱います。共通祖先やツリー差分の判定はすべて削除開始前に完了させ、各ブランチの先端と worktree 使用状態の再確認は操作直前に行います。
 
@@ -26,11 +30,14 @@ macOS / Linux で通常の OpenSSH 6.7 以降を使う SSH リモートには、
 
 - `ControlMaster=auto`：接続があれば再利用し、なければ接続を作ります。
 - `ControlPersist=60`：最後の利用から60秒間、OpenSSH が接続を保持します。
+- `SendEnv=GIT_PROTOCOL`：接続を再利用した場合も、その照会が選んだ Git プロトコルをサーバーへ渡します。
 - `ControlPath=/tmp/giclean-ssh-<uid>/cm-<url-hash>-%C`：利用者とリモート URL ごとに共有先を分けます。`%C` は接続先のホスト・ポート・ユーザーなどを区別します。
 
 制御ソケットのディレクトリは所有者本人だけがアクセスできる `0700` で作成し、所有者・権限・シンボリックリンクでないことを確認します。接続共有は OpenSSH が管理し、Rust の常駐プロセスは起動しません。
 
 `GIT_SSH_COMMAND` / `GIT_SSH` / `GIT_SSH_VARIANT`、Git の `core.sshCommand` / `ssh.variant` が指定済みの場合は、自動適用せず、その指定に従います。OpenSSH が対応していない場合や安全なソケットディレクトリを用意できない場合も、通常の Git 接続を使います。HTTPS やローカルリモートには適用しません。
+
+この自動適用時に `protocol.version` が未指定なら、リモート照会に限って Git のプロトコル v0 を指定します。v2 の能力交渉後の `ls-refs` 要求を省き、通信往復を一回減らします。v0 は全参照の広告を受信するため、参照が非常に多い環境では v2 の方が適する可能性があります。リポジトリ・グローバル設定・コマンドスコープの環境変数で `protocol.version` が明示されている場合は維持します。Git の設定ファイルやリモート設定は書き換えません。[プロトコルの選択](https://git-scm.com/docs/git-config#Documentation/git-config.txt-protocolversion)と [v2 の参照照会](https://git-scm.com/docs/protocol-v2#_ls_refs)は Git の公式仕様に従います。
 
 鍵・ホスト鍵検証・ProxyJump など、通常の OpenSSH 設定は引き継ぎます。SSH 設定ファイルやシェル設定は変更しません。共有するのは接続だけで、既定ブランチ名・コミット ID は毎回リモートへ問い合わせます。初回接続の待ち時間は残ります。
 

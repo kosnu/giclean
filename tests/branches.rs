@@ -1040,9 +1040,10 @@ mod unix {
         fs::create_dir(&bin).unwrap();
         let path = bin.join("ssh");
         fs::write(&path, format!(
-            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$1\" >> {}\nif [ \"$1\" = -V ]; then\nprintf '%s\\n' \"${{TEST_SSH_VERSION:-OpenSSH_9.9p2}}\" >&2\nexit 0\nfi\nif [ \"$1\" = -G ]; then\nexit 0\nfi\nprintf '%s\\n' \"$@\" > {}\nexec {} upload-pack {}\n",
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$1\" >> {}\nif [ \"$1\" = -V ]; then\nprintf '%s\\n' \"${{TEST_SSH_VERSION:-OpenSSH_9.9p2}}\" >&2\nexit 0\nfi\nif [ \"$1\" = -G ]; then\nexit 0\nfi\nprintf '%s\\n' \"$@\" > {}\nprintf '%s\\n' \"${{GIT_PROTOCOL:-}}\" > {}\nexec {} upload-pack {}\n",
             shell_quote(&repo.root.join("ssh-calls")),
             shell_quote(&repo.root.join("ssh-args")),
+            shell_quote(&repo.root.join("git-protocol")),
             shell_quote(&real_git),
             shell_quote(&repo.origin),
         )).unwrap();
@@ -1056,6 +1057,45 @@ mod unix {
             .args(["br", "--dry-run"])
             .env("PATH", std::env::join_paths(paths).unwrap());
         command
+    }
+
+    #[test]
+    fn ssh_default_protocol_and_explicit_protocols_return_the_same_candidates() {
+        for format in ["sha1", "sha256"] {
+            for setting in ["default", "repository", "environment"] {
+                let repo = Repo::with_format(format);
+                let mut command = ssh_transport(&repo);
+                match setting {
+                    "repository" => {
+                        repo.git(&["config", "protocol.version", "2"]);
+                    }
+                    "environment" => {
+                        command
+                            .env("GIT_CONFIG_COUNT", "1")
+                            .env("GIT_CONFIG_KEY_0", "protocol.version")
+                            .env("GIT_CONFIG_VALUE_0", "2");
+                    }
+                    _ => {}
+                }
+                let output = checked(&mut command);
+                assert_eq!(text(&output.stdout), "candidate: merged");
+                let protocol = fs::read_to_string(repo.root.join("git-protocol")).unwrap();
+                assert_eq!(
+                    protocol.trim(),
+                    if setting == "default" {
+                        ""
+                    } else {
+                        "version=2"
+                    },
+                    "{format}: {setting}"
+                );
+                let args = fs::read_to_string(repo.root.join("ssh-args")).unwrap();
+                assert!(args.contains("ControlMaster=auto"));
+                assert!(args.contains("SendEnv=GIT_PROTOCOL"));
+                assert!(repo.exists("merged"));
+                assert!(!repo.work.join(".git/FETCH_HEAD").exists());
+            }
+        }
     }
 
     #[test]
@@ -1205,6 +1245,67 @@ mod unix {
     }
 
     #[test]
+    fn identical_trees_settle_eligibility_without_diffing_files() {
+        for format in ["sha1", "sha256"] {
+            for target_matches in ["base", "tip"] {
+                let repo = Repo::with_format(format);
+                let base = repo.git(&["rev-parse", "HEAD"]);
+                let base_tree = repo.git(&["rev-parse", "HEAD^{tree}"]);
+                let blob = repo.git_input(&["hash-object", "-w", "--stdin"], b"feature\n");
+                let tree = repo.git_input(
+                    &["mktree"],
+                    format!("100755 blob {blob}\tfeature\n").as_bytes(),
+                );
+                let tip = repo.git(&["commit-tree", &tree, "-p", &base, "-m", "feature"]);
+                let empty = repo.git(&[
+                    "commit-tree",
+                    &base_tree,
+                    "-p",
+                    &base,
+                    "-m",
+                    "no net changes",
+                ]);
+                let target_tree = if target_matches == "base" {
+                    &base_tree
+                } else {
+                    &tree
+                };
+                let target =
+                    repo.git(&["commit-tree", target_tree, "-p", &base, "-m", "integration"]);
+                repo.git_input(
+                    &["update-ref", "--stdin"],
+                    format!(
+                        "create refs/heads/topic {tip}\ncreate refs/heads/alias {tip}\ncreate refs/heads/empty {empty}\nupdate refs/heads/main {target}\n"
+                    ).as_bytes(),
+                );
+                repo.git(&["reset", "--hard", "main"]);
+                repo.git(&["push", "origin", "main"]);
+                let before = repo.git(&["show-ref"]);
+                let mut command = shim(&repo, "if [ \"$1\" = diff-tree ]; then exit 91; fi");
+                let output = command.arg("--dry-run").output().unwrap();
+                assert_success(&output);
+                let expected = if target_matches == "tip" {
+                    "candidate: alias\ncandidate: topic"
+                } else {
+                    ""
+                };
+                assert_eq!(text(&output.stdout), expected);
+                assert_eq!(repo.git(&["show-ref"]), before);
+                let output = repo.run(&["br"]);
+                assert_success(&output);
+                assert_eq!(repo.exists("topic"), target_matches == "base");
+                assert_eq!(repo.exists("alias"), target_matches == "base");
+                assert!(repo.exists("empty"));
+                assert!(repo.exists("main"));
+                assert!(!repo.work.join(".git/FETCH_HEAD").exists());
+                let calls = fs::read_to_string(repo.root.join("calls")).unwrap();
+                assert!(!calls.lines().any(|call| call == "diff-tree"));
+                assert_eq!(calls.lines().filter(|call| *call == "ls-remote").count(), 1);
+            }
+        }
+    }
+
+    #[test]
     fn squash_detection_errors_stop_before_any_deletion() {
         for condition in [
             "[ \"$1\" = rev-parse ] && [ \"${2:-}\" = --revs-only ]",
@@ -1219,6 +1320,8 @@ mod unix {
             repo.git(&["commit", "-m", "feature"]);
             repo.git(&["switch", "main"]);
             repo.git(&["merge", "--squash", "squash"]);
+            fs::write(repo.work.join("unrelated"), "independent change\n").unwrap();
+            repo.git(&["add", "unrelated"]);
             repo.git(&["commit", "-m", "squash merge"]);
             repo.git(&["push", "origin", "main"]);
             let hook = format!("if {condition}; then exit 91; fi");
@@ -1330,6 +1433,8 @@ mod unix {
             repo.git(&["commit", "-m", "feature"]);
             repo.git(&["switch", "main"]);
             repo.git(&["merge", "--squash", "squash"]);
+            fs::write(repo.work.join("unrelated"), "independent change\n").unwrap();
+            repo.git(&["add", "unrelated"]);
             repo.git(&["commit", "-m", "squash merge"]);
             repo.git(&["push", "origin", "main"]);
             let hook = format!(
