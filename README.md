@@ -16,6 +16,24 @@ macOS / Linux 対応。実行には Git 2.47 以降が必要です。
 cargo install --path . --locked
 ```
 
+## 更新
+
+配布バイナリを使っている場合は、[GitHub Releases](https://github.com/kosnu/giclean/releases) から更新したいリリースの OS・CPU に合う `.tar.gz` をダウンロードします。同じリリースの `SHA256SUMS` で整合性を確認し、展開した `giclean` で配置済みのバイナリを置き換えます。
+
+ソースからインストールした場合は、ソースを更新したうえで、そのディレクトリで再インストールします。
+
+```sh
+cargo install --path . --locked
+```
+
+`--path` を指定すると毎回ビルド・インストールするため、通常は `--force` は不要です。
+
+更新後はバージョンを確認します。
+
+```sh
+giclean --version
+```
+
 ## 使い方
 
 整理したいリポジトリ内で実行します。
