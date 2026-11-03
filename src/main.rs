@@ -4,6 +4,8 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::process::{Command, ExitCode, Output, Stdio};
 
+mod bulk;
+mod git;
 mod progress;
 mod ssh;
 
@@ -69,6 +71,9 @@ struct RemoteHead {
 }
 
 fn main() -> ExitCode {
+    if let Some(status) = bulk::hook() {
+        return status;
+    }
     let action = match parse_args(env::args_os().skip(1)) {
         Ok(action) => action,
         Err(error) => {
@@ -124,7 +129,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Action, String> {
 }
 
 fn git(args: &[&str]) -> Command {
-    let mut command = Command::new("git");
+    let mut command = git::command();
     command
         // Unsupported Git versions fail before doing any work, instead of silently
         // ignoring the no-lazy-fetch environment variable.
@@ -278,7 +283,11 @@ fn squash_included(
     for chunk in branches.chunks(BATCH_SIZE) {
         let pairs: BTreeSet<_> = chunk
             .iter()
-            .filter(|(tip, base)| trees[tip.as_str()] != trees[base.as_str()])
+            .filter(|(tip, base)| {
+                trees[tip.as_str()] != trees[base.as_str()]
+                    && trees[tip.as_str()] != trees[target]
+                    && trees[base.as_str()] != trees[target]
+            })
             .flat_map(|(tip, base)| {
                 [
                     (trees[base.as_str()].clone(), trees[tip.as_str()].clone()),
@@ -286,12 +295,21 @@ fn squash_included(
                 ]
             })
             .collect();
-        if pairs.is_empty() {
-            continue;
-        }
-        let diffs = tree_changes(&pairs, progress)?;
+        let diffs = if pairs.is_empty() {
+            BTreeMap::new()
+        } else {
+            tree_changes(&pairs, progress)?
+        };
         for (tip, base) in chunk {
-            if trees[tip.as_str()] == trees[base.as_str()] {
+            // Identical immutable trees settle these cases without walking files:
+            // no net changes stays ineligible; an unchanged target contains none
+            // of a divergent tip's changes; an identical target contains them all.
+            if trees[tip.as_str()] == trees[base.as_str()] || trees[base.as_str()] == trees[target]
+            {
+                continue;
+            }
+            if trees[tip.as_str()] == trees[target] {
+                included.insert((*tip).clone());
                 continue;
             }
             let changes = &diffs[&(trees[base.as_str()].clone(), trees[tip.as_str()].clone())];
@@ -399,8 +417,9 @@ fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<ExitCode, Strin
     progress.update("Checking origin's default branch and latest commit...");
     let origin = git_text(&["remote", "get-url", "origin"], &progress)?;
     progress.pause_for_input();
-    let mut query = git(&["ls-remote", "--symref", "--exit-code", "origin", "HEAD"]);
+    let mut query = git(&[]);
     ssh::configure(&mut query, origin.trim());
+    query.args(["ls-remote", "--symref", "--exit-code", "origin", "HEAD"]);
     let remote = parse_remote_head(&git_command_text(query, "ls-remote", &progress)?)?;
     git_text(
         &["check-ref-format", &format!("refs/heads/{}", remote.branch)],
@@ -440,6 +459,30 @@ fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<ExitCode, Strin
     });
     let mut results = Vec::new();
     let mut failed = false;
+    let candidates: BTreeMap<_, _> = merged
+        .iter()
+        .filter(|(name, branch)| {
+            !branch.protected()
+                && *name != &remote.branch
+                && initial.get(*name).is_some_and(|old| old.oid == branch.oid)
+        })
+        .map(|(name, branch)| (name.clone(), branch.clone()))
+        .collect();
+    let batch_failure = if dry_run {
+        None
+    } else {
+        match bulk::delete(&candidates, &progress)? {
+            bulk::Outcome::Deleted => {
+                progress.finish();
+                for name in candidates.keys() {
+                    writeln!(out, "{name}: deleted").map_err(|e| e.to_string())?;
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+            bulk::Outcome::Retry(output) => Some(output),
+            bulk::Outcome::Individual => None,
+        }
+    };
     for (name, branch) in merged {
         if branch.protected()
             || name == remote.branch
@@ -461,6 +504,18 @@ fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<ExitCode, Strin
                 return Err(error);
             }
         };
+        // A failed batch may have removed refs before branch-config cleanup
+        // failed. Preserve those failure rows instead of silently losing them.
+        if !latest.contains_key(&name) {
+            if let Some(output) = &batch_failure {
+                failed = true;
+                results.push(format!(
+                    "{name}: failed ({})",
+                    deletion_reason(&name, output)
+                ));
+            }
+            continue;
+        }
         if latest
             .get(&name)
             .is_none_or(|current| current.protected() || current.oid != branch.oid)

@@ -900,7 +900,7 @@ mod unix {
         for branch in ["merged", "日本語/マージ済み"] {
             repo.git(&["branch", branch]);
         }
-        let command = shim(&repo, "if [ \"$1\" = branch ]; then sleep 0.2; fi");
+        let command = shim(&repo, "case \"$1\" in branch|-c) sleep 0.2 ;; esac");
         let output = in_terminal(&command);
         assert_success(&output);
         let display = text(&output.stdout);
@@ -1024,6 +1024,266 @@ mod unix {
         command
     }
 
+    // These tests exercise the individual fallback's precise failure boundary.
+    fn individual_shim(repo: &Repo, hook: &str) -> Command {
+        let hooks = repo.root.join("user-hooks");
+        fs::create_dir(&hooks).unwrap();
+        let path = hooks.join("reference-transaction");
+        fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        checked(
+            repo.git_command()
+                .args(["config", "core.hooksPath"])
+                .arg(hooks),
+        );
+        shim(repo, hook)
+    }
+
+    #[test]
+    fn bulk_deletion_preserves_protection_cleans_config_and_uses_one_delete() {
+        for format in ["sha1", "sha256"] {
+            let repo = Repo::with_format(format);
+            for name in ["topic-a", "日本語/完了", "used", "master", "production"] {
+                repo.git(&["branch", name]);
+            }
+            for name in ["topic-a", "日本語/完了"] {
+                repo.git(&["config", &format!("branch.{name}.description"), "cleanup"]);
+            }
+            repo.add_worktree("used", "linked");
+            let output = shim(&repo, "").output().unwrap();
+            assert_success(&output);
+            assert_eq!(
+                text(&output.stdout),
+                "topic-a: deleted\n日本語/完了: deleted"
+            );
+            for name in ["main", "used", "master", "production"] {
+                assert!(repo.exists(name));
+            }
+            for name in ["topic-a", "日本語/完了"] {
+                assert!(!repo.exists(name));
+            }
+            assert!(
+                repo.git_command()
+                    .args([
+                        "config",
+                        "--get-regexp",
+                        r"^branch\.(topic-a|日本語/完了)\."
+                    ])
+                    .output()
+                    .unwrap()
+                    .stdout
+                    .is_empty()
+            );
+            let calls = fs::read_to_string(repo.root.join("calls")).unwrap();
+            assert_eq!(calls.lines().filter(|c| *c == "-c").count(), 1);
+            assert_eq!(calls.lines().filter(|c| *c == "for-each-ref").count(), 3);
+            assert!(!repo.work.join(".git/FETCH_HEAD").exists());
+        }
+    }
+
+    #[test]
+    fn bulk_rechecks_changed_tip_before_committing() {
+        let repo = Repo::new();
+        for name in ["a", "z"] {
+            repo.git(&["branch", name]);
+        }
+        repo.git(&["switch", "-c", "future"]);
+        fs::write(repo.work.join("feature"), "unmerged\n").unwrap();
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "unmerged"]);
+        let future = repo.git(&["rev-parse", "HEAD"]);
+        repo.git(&["switch", "main"]);
+        let hook =
+            format!("if [ \"$1\" = -c ]; then \"$real_git\" update-ref refs/heads/z {future}; fi");
+        let output = shim(&repo, &hook).output().unwrap();
+        assert_success(&output);
+        assert_eq!(text(&output.stdout), "a: deleted");
+        assert_eq!(repo.git(&["rev-parse", "z"]), future);
+        assert!(repo.exists("future"));
+    }
+
+    #[test]
+    fn bulk_preserves_a_branch_that_becomes_symbolic_with_the_same_oid() {
+        let repo = Repo::new();
+        for name in ["a", "z"] {
+            repo.git(&["branch", name]);
+        }
+        let hook =
+            "if [ \"$1\" = -c ]; then \"$real_git\" symbolic-ref refs/heads/z refs/heads/main; fi";
+        let output = shim(&repo, hook).output().unwrap();
+        assert_success(&output);
+        assert_eq!(text(&output.stdout), "a: deleted");
+        assert_eq!(
+            repo.git(&["symbolic-ref", "refs/heads/z"]),
+            "refs/heads/main"
+        );
+        assert!(repo.exists("main"));
+    }
+
+    #[test]
+    fn bulk_setup_failure_and_large_sets_use_individual_deletion() {
+        for count in [2, 129] {
+            let repo = Repo::new();
+            let oid = repo.git(&["rev-parse", "HEAD"]);
+            let refs: String = (0..count)
+                .map(|i| format!("create refs/heads/topic-{i:03} {oid}\n"))
+                .collect();
+            repo.git_input(&["update-ref", "--stdin"], refs.as_bytes());
+            let invalid_tmp = repo.root.join("not-a-directory");
+            fs::write(&invalid_tmp, "file").unwrap();
+            let output = shim(&repo, "").env("TMPDIR", invalid_tmp).output().unwrap();
+            assert_success(&output);
+            assert_eq!(text(&output.stdout).lines().count(), count);
+            let calls = fs::read_to_string(repo.root.join("calls")).unwrap();
+            assert!(!calls.lines().any(|c| c == "-c"));
+            assert_eq!(
+                repo.git(&["for-each-ref", "--format=%(refname)", "refs/heads/"]),
+                "refs/heads/main"
+            );
+        }
+    }
+
+    #[test]
+    fn bulk_dry_run_keeps_individual_validation_and_all_refs() {
+        let repo = Repo::new();
+        for name in ["a", "z"] {
+            repo.git(&["branch", name]);
+        }
+        let before = repo.git(&["show-ref"]);
+        let output = shim(&repo, "if [ \"$1\" = -c ]; then exit 99; fi")
+            .arg("--dry-run")
+            .output()
+            .unwrap();
+        assert_success(&output);
+        assert_eq!(text(&output.stdout), "candidate: a\ncandidate: z");
+        assert_eq!(repo.git(&["show-ref"]), before);
+        let calls = fs::read_to_string(repo.root.join("calls")).unwrap();
+        assert_eq!(calls.lines().filter(|c| *c == "for-each-ref").count(), 4);
+    }
+
+    #[test]
+    fn bulk_rechecks_worktree_created_after_git_initial_worktree_check() {
+        let repo = Repo::new();
+        for name in ["a", "z"] {
+            repo.git(&["branch", name]);
+        }
+        let linked = repo.root.join("late-linked");
+        let marker = repo.root.join("mutation");
+        let disabled_hooks = format!("core.hooksPath={}", repo.root.join("no-hooks").display());
+        let hook = format!(
+            "if [ \"$1\" = for-each-ref ] && [ -n \"${{GICLEAN_GUARD_DIRECTORY:-}}\" ] && [ ! -f {} ]; then\ntouch {}\n\"$real_git\" -c {} worktree add --no-checkout -q {} z\nfi",
+            shell_quote(&marker),
+            shell_quote(&marker),
+            shell_quote(Path::new(&disabled_hooks)),
+            shell_quote(&linked)
+        );
+        let output = shim(&repo, &hook).output().unwrap();
+        assert_success(&output);
+        assert_eq!(text(&output.stdout), "a: deleted");
+        assert!(marker.exists());
+        assert!(repo.exists("z"));
+        assert!(!repo.exists("a"));
+        assert!(
+            repo.git(&["worktree", "list", "--porcelain"])
+                .contains("branch refs/heads/z")
+        );
+    }
+
+    #[test]
+    fn bulk_guard_read_errors_stop_without_fallback_or_deletions() {
+        for response in ["exit 91", "printf 'invalid\\n'; exit 0"] {
+            let repo = Repo::new();
+            for name in ["a", "z"] {
+                repo.git(&["branch", name]);
+            }
+            let guards = repo.work.join("guards");
+            fs::create_dir(&guards).unwrap();
+            let sub = repo.work.join("sub");
+            fs::create_dir(&sub).unwrap();
+            let hook = format!(
+                "if [ \"$1\" = for-each-ref ] && [ -n \"${{GICLEAN_GUARD_DIRECTORY:-}}\" ]; then {response}; fi"
+            );
+            let output = shim(&repo, &hook)
+                .current_dir(sub)
+                .env("TMPDIR", "../guards")
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(1));
+            assert!(output.stdout.is_empty());
+            for name in ["a", "z"] {
+                assert!(repo.exists(name));
+            }
+            assert_eq!(fs::read_dir(guards).unwrap().count(), 0);
+            let calls = fs::read_to_string(repo.root.join("calls")).unwrap();
+            assert!(!calls.lines().any(|c| c == "branch"));
+        }
+    }
+
+    #[test]
+    fn bulk_existing_relative_hook_veto_is_preserved_from_subdirectory() {
+        let repo = Repo::new();
+        for name in ["a", "z"] {
+            repo.git(&["branch", name]);
+        }
+        let hooks = repo.work.join("policy");
+        fs::create_dir(&hooks).unwrap();
+        let hook = hooks.join("reference-transaction");
+        fs::write(
+            &hook,
+            "#!/bin/sh\n[ \"$1\" = prepared ] || exit 0\nprintf 'veto\\n' >&2\nexit 42\n",
+        )
+        .unwrap();
+        fs::set_permissions(hook, fs::Permissions::from_mode(0o700)).unwrap();
+        repo.git(&["config", "core.hooksPath", "policy"]);
+        let sub = repo.work.join("sub");
+        fs::create_dir(&sub).unwrap();
+        let output = repo.cli().arg("br").current_dir(sub).output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(text(&output.stdout).contains("veto"));
+        for name in ["a", "z"] {
+            assert!(repo.exists(name));
+        }
+    }
+
+    #[test]
+    fn bulk_reports_errors_after_refs_were_deleted() {
+        let repo = Repo::new();
+        for name in ["a", "z"] {
+            repo.git(&["branch", name]);
+        }
+        let hook = "if [ \"$1\" = -c ]; then \"$real_git\" --no-lazy-fetch \"$@\"; printf 'cleanup failed\\n' >&2; exit 23; fi";
+        let output = shim(&repo, hook).output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            text(&output.stdout),
+            "a: failed (cleanup failed)\nz: failed (cleanup failed)"
+        );
+        for name in ["a", "z"] {
+            assert!(!repo.exists(name));
+        }
+    }
+
+    #[test]
+    fn bulk_skips_branches_removed_concurrently_before_the_batch() {
+        for removed in ["z", "a z"] {
+            let repo = Repo::new();
+            for name in ["a", "z"] {
+                repo.git(&["branch", name]);
+            }
+            let hook = format!(
+                "if [ \"$1\" = -c ]; then for name in {removed}; do \"$real_git\" update-ref -d refs/heads/$name; done; fi"
+            );
+            let output = shim(&repo, &hook).output().unwrap();
+            assert_success(&output);
+            assert_eq!(
+                text(&output.stdout),
+                if removed == "z" { "a: deleted" } else { "" }
+            );
+            assert!(!repo.exists("a"));
+            assert!(!repo.exists("z"));
+        }
+    }
+
     // The SSH boundary is simulated; the advertised refs come from a real local
     // upload-pack process, without network access or user SSH configuration.
     fn ssh_transport(repo: &Repo) -> Command {
@@ -1040,9 +1300,10 @@ mod unix {
         fs::create_dir(&bin).unwrap();
         let path = bin.join("ssh");
         fs::write(&path, format!(
-            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$1\" >> {}\nif [ \"$1\" = -V ]; then\nprintf '%s\\n' \"${{TEST_SSH_VERSION:-OpenSSH_9.9p2}}\" >&2\nexit 0\nfi\nif [ \"$1\" = -G ]; then\nexit 0\nfi\nprintf '%s\\n' \"$@\" > {}\nexec {} upload-pack {}\n",
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$1\" >> {}\nif [ \"$1\" = -V ]; then\nprintf '%s\\n' \"${{TEST_SSH_VERSION:-OpenSSH_9.9p2}}\" >&2\nexit 0\nfi\nif [ \"$1\" = -G ]; then\nexit 0\nfi\nprintf '%s\\n' \"$@\" > {}\nprintf '%s\\n' \"${{GIT_PROTOCOL:-}}\" > {}\nexec {} upload-pack {}\n",
             shell_quote(&repo.root.join("ssh-calls")),
             shell_quote(&repo.root.join("ssh-args")),
+            shell_quote(&repo.root.join("git-protocol")),
             shell_quote(&real_git),
             shell_quote(&repo.origin),
         )).unwrap();
@@ -1056,6 +1317,45 @@ mod unix {
             .args(["br", "--dry-run"])
             .env("PATH", std::env::join_paths(paths).unwrap());
         command
+    }
+
+    #[test]
+    fn ssh_default_protocol_and_explicit_protocols_return_the_same_candidates() {
+        for format in ["sha1", "sha256"] {
+            for setting in ["default", "repository", "environment"] {
+                let repo = Repo::with_format(format);
+                let mut command = ssh_transport(&repo);
+                match setting {
+                    "repository" => {
+                        repo.git(&["config", "protocol.version", "2"]);
+                    }
+                    "environment" => {
+                        command
+                            .env("GIT_CONFIG_COUNT", "1")
+                            .env("GIT_CONFIG_KEY_0", "protocol.version")
+                            .env("GIT_CONFIG_VALUE_0", "2");
+                    }
+                    _ => {}
+                }
+                let output = checked(&mut command);
+                assert_eq!(text(&output.stdout), "candidate: merged");
+                let protocol = fs::read_to_string(repo.root.join("git-protocol")).unwrap();
+                assert_eq!(
+                    protocol.trim(),
+                    if setting == "default" {
+                        ""
+                    } else {
+                        "version=2"
+                    },
+                    "{format}: {setting}"
+                );
+                let args = fs::read_to_string(repo.root.join("ssh-args")).unwrap();
+                assert!(args.contains("ControlMaster=auto"));
+                assert!(args.contains("SendEnv=GIT_PROTOCOL"));
+                assert!(repo.exists("merged"));
+                assert!(!repo.work.join(".git/FETCH_HEAD").exists());
+            }
+        }
     }
 
     #[test]
@@ -1205,6 +1505,67 @@ mod unix {
     }
 
     #[test]
+    fn identical_trees_settle_eligibility_without_diffing_files() {
+        for format in ["sha1", "sha256"] {
+            for target_matches in ["base", "tip"] {
+                let repo = Repo::with_format(format);
+                let base = repo.git(&["rev-parse", "HEAD"]);
+                let base_tree = repo.git(&["rev-parse", "HEAD^{tree}"]);
+                let blob = repo.git_input(&["hash-object", "-w", "--stdin"], b"feature\n");
+                let tree = repo.git_input(
+                    &["mktree"],
+                    format!("100755 blob {blob}\tfeature\n").as_bytes(),
+                );
+                let tip = repo.git(&["commit-tree", &tree, "-p", &base, "-m", "feature"]);
+                let empty = repo.git(&[
+                    "commit-tree",
+                    &base_tree,
+                    "-p",
+                    &base,
+                    "-m",
+                    "no net changes",
+                ]);
+                let target_tree = if target_matches == "base" {
+                    &base_tree
+                } else {
+                    &tree
+                };
+                let target =
+                    repo.git(&["commit-tree", target_tree, "-p", &base, "-m", "integration"]);
+                repo.git_input(
+                    &["update-ref", "--stdin"],
+                    format!(
+                        "create refs/heads/topic {tip}\ncreate refs/heads/alias {tip}\ncreate refs/heads/empty {empty}\nupdate refs/heads/main {target}\n"
+                    ).as_bytes(),
+                );
+                repo.git(&["reset", "--hard", "main"]);
+                repo.git(&["push", "origin", "main"]);
+                let before = repo.git(&["show-ref"]);
+                let mut command = shim(&repo, "if [ \"$1\" = diff-tree ]; then exit 91; fi");
+                let output = command.arg("--dry-run").output().unwrap();
+                assert_success(&output);
+                let expected = if target_matches == "tip" {
+                    "candidate: alias\ncandidate: topic"
+                } else {
+                    ""
+                };
+                assert_eq!(text(&output.stdout), expected);
+                assert_eq!(repo.git(&["show-ref"]), before);
+                let output = repo.run(&["br"]);
+                assert_success(&output);
+                assert_eq!(repo.exists("topic"), target_matches == "base");
+                assert_eq!(repo.exists("alias"), target_matches == "base");
+                assert!(repo.exists("empty"));
+                assert!(repo.exists("main"));
+                assert!(!repo.work.join(".git/FETCH_HEAD").exists());
+                let calls = fs::read_to_string(repo.root.join("calls")).unwrap();
+                assert!(!calls.lines().any(|call| call == "diff-tree"));
+                assert_eq!(calls.lines().filter(|call| *call == "ls-remote").count(), 1);
+            }
+        }
+    }
+
+    #[test]
     fn squash_detection_errors_stop_before_any_deletion() {
         for condition in [
             "[ \"$1\" = rev-parse ] && [ \"${2:-}\" = --revs-only ]",
@@ -1219,6 +1580,8 @@ mod unix {
             repo.git(&["commit", "-m", "feature"]);
             repo.git(&["switch", "main"]);
             repo.git(&["merge", "--squash", "squash"]);
+            fs::write(repo.work.join("unrelated"), "independent change\n").unwrap();
+            repo.git(&["add", "unrelated"]);
             repo.git(&["commit", "-m", "squash merge"]);
             repo.git(&["push", "origin", "main"]);
             let hook = format!("if {condition}; then exit 91; fi");
@@ -1330,6 +1693,8 @@ mod unix {
             repo.git(&["commit", "-m", "feature"]);
             repo.git(&["switch", "main"]);
             repo.git(&["merge", "--squash", "squash"]);
+            fs::write(repo.work.join("unrelated"), "independent change\n").unwrap();
+            repo.git(&["add", "unrelated"]);
             repo.git(&["commit", "-m", "squash merge"]);
             repo.git(&["push", "origin", "main"]);
             let hook = format!(
@@ -1433,7 +1798,7 @@ mod unix {
             "if [ \"$1\" = branch ] && [ \"${{5:-}}\" = a-blocked ]; then\n\"$real_git\" worktree add -q {} a-blocked\nfi",
             shell_quote(&repo.root.join("late-worktree")),
         );
-        let output = shim(&repo, &hook).output().unwrap();
+        let output = individual_shim(&repo, &hook).output().unwrap();
         assert_eq!(output.status.code(), Some(1));
         assert_eq!(
             text(&output.stdout),
@@ -1470,7 +1835,7 @@ mod unix {
         repo.git(&["branch", "a-blocked"]);
         repo.git(&["branch", "z-merged"]);
         let hook = "if [ \"$1\" = branch ]; then [ \"$LC_ALL\" = C ] || exit 90; if [ \"${5:-}\" = a-blocked ]; then exit 23; fi; fi";
-        let output = shim(&repo, hook).output().unwrap();
+        let output = individual_shim(&repo, hook).output().unwrap();
         assert_eq!(output.status.code(), Some(1));
         assert_eq!(
             text(&output.stdout),
@@ -1490,7 +1855,7 @@ mod unix {
             "if [ \"$1\" = branch ] && [ \"${{5:-}}\" = a-blocked ]; then\n\"$real_git\" worktree add -q {} a-blocked\nsleep 0.3\nfi",
             shell_quote(&repo.root.join("late-worktree")),
         );
-        let output = in_terminal(&shim(&repo, &hook));
+        let output = in_terminal(&individual_shim(&repo, &hook));
         let display = text(&output.stdout);
         let (progress, results) = display.split_once("a-blocked: failed").unwrap();
         assert!(!progress.contains('\n'), "{display}");
@@ -1507,7 +1872,7 @@ mod unix {
             repo.git(&["branch", branch]);
         }
         let hook = "if [ \"$1\" = for-each-ref ] && [ \"${4:-}\" = refs/heads/b-unreadable ]; then\nexit 91\nfi";
-        let output = shim(&repo, hook).output().unwrap();
+        let output = individual_shim(&repo, hook).output().unwrap();
         assert_eq!(output.status.code(), Some(1));
         assert_eq!(text(&output.stdout), "a-merged: deleted");
         assert!(!repo.exists("a-merged"));

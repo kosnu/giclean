@@ -16,17 +16,26 @@ pub fn configure(command: &mut Command, remote: &str) {
         return;
     }
     // An explicitly selected SSH command or variant belongs to the user.
-    let Ok(config) = Command::new("git")
+    let Ok(config) = crate::git::command()
         .args([
             "config",
             "--get-regexp",
-            r"^(core\.sshcommand|ssh\.variant)$",
+            r"^(core\.sshcommand|ssh\.variant|protocol\.version)$",
         ])
         .output()
     else {
         return;
     };
-    if config.status.code() != Some(1) {
+    if !matches!(config.status.code(), Some(0 | 1)) {
+        return;
+    }
+    let Ok(config) = std::str::from_utf8(&config.stdout) else {
+        return;
+    };
+    if config
+        .lines()
+        .any(|line| !line.starts_with("protocol.version "))
+    {
         return;
     }
     let Ok(version) = Command::new("ssh").arg("-V").output() else {
@@ -57,13 +66,18 @@ pub fn configure(command: &mut Command, remote: &str) {
     // The URL hash also separates host aliases that use different identities.
     // Only numeric/hex values and fixed text enter this shell-interpreted value.
     let ssh = format!(
-        "ssh -o ControlMaster=auto -o ControlPersist=60 -o ControlPath={}/cm-{:016x}-%C",
+        "ssh -o ControlMaster=auto -o ControlPersist=60 -o SendEnv=GIT_PROTOCOL -o ControlPath={}/cm-{:016x}-%C",
         directory.display(),
         hash.finish()
     );
     command
         .env("GIT_SSH_COMMAND", ssh)
         .env("GIT_SSH_VARIANT", "ssh");
+    // v0 advertises HEAD immediately; v2 needs an additional ls-refs round trip.
+    // Keep an explicitly selected protocol, including command-scope settings.
+    if config.is_empty() {
+        command.args(["-c", "protocol.version=0"]);
+    }
 }
 
 #[cfg(not(unix))]
