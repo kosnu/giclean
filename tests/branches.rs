@@ -1177,10 +1177,18 @@ mod unix {
     }
 
     fn in_terminal(command: &Command) -> Output {
-        terminal_command(command)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .unwrap()
+        use std::process::Stdio;
+
+        let mut child = terminal_command(command)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Keep the terminal open until the command exits. Sending EOF here can
+        // echo ^D into a nested PTY before Git has even started.
+        let _input = child.stdin.take().unwrap();
+        child.wait_with_output().unwrap()
     }
 
     #[test]
@@ -1195,7 +1203,7 @@ mod unix {
         let request = repo.root.join("credential-request");
         fs::write(&request, "protocol=https\nhost=example.invalid\n\n").unwrap();
         let hook = format!(
-            "if [ \"$1\" = ls-remote ]; then\n\"$real_git\" -c credential.helper= credential fill < {} > /dev/null\nfi",
+            "if [ \"$1\" = ls-remote ]; then\nsleep 0.4\n\"$real_git\" -c credential.helper= credential fill < {} > /dev/null\nfi",
             shell_quote(&request),
         );
         let mut command = shim(&repo, &hook);
@@ -1267,6 +1275,15 @@ mod unix {
         let display = String::from_utf8_lossy(&transcript);
         assert!(status.success(), "{display}");
         assert_eq!(redraws_during_input, [false, false], "{display}");
+        let before_prompt = display.split_once("Username for ").unwrap().0;
+        assert!(
+            before_prompt
+                .matches("Checking origin's default branch and latest commit...")
+                .count()
+                >= 3,
+            "{display}"
+        );
+        assert!(!display.contains("repro-password"), "{display}");
         assert!(display.contains("candidate: merged"), "{display}");
         assert!(repo.exists("merged"));
         assert!(!repo.work.join(".git/FETCH_HEAD").exists());
@@ -1276,8 +1293,10 @@ mod unix {
     fn terminal_progress_updates_one_line_and_completes_dry_run() {
         let repo = Repo::new();
         repo.git(&["branch", "merged"]);
+        let temporary = repo.root.join("terminal ' $(not-a-command)");
+        fs::create_dir(&temporary).unwrap();
         let mut command = shim(&repo, "if [ \"$1\" = ls-remote ]; then sleep 0.4; fi");
-        command.arg("--dry-run");
+        command.arg("--dry-run").env("TMPDIR", &temporary);
         let output = in_terminal(&command);
         assert_success(&output);
         let display = text(&output.stdout);
@@ -1285,12 +1304,41 @@ mod unix {
         let before_results = display.split_once("candidate: merged").unwrap().0;
         assert!(!before_results.contains('\n'), "{display}");
         assert!(before_results.contains("Checking origin's default branch and latest commit..."));
+        assert!(
+            before_results
+                .matches("Checking origin's default branch and latest commit...")
+                .count()
+                >= 3,
+            "{display}"
+        );
         assert!(before_results.contains("Checking merged branches..."));
         assert!(!display.contains("秒"), "{display}");
         assert!(!display.contains('✔'), "{display}");
         assert!(display.ends_with("candidate: merged"), "{display}");
         assert!(repo.exists("merged"));
         assert!(!repo.work.join(".git/FETCH_HEAD").exists());
+        assert_eq!(fs::read_dir(&temporary).unwrap().count(), 0);
+        let calls = fs::read_to_string(repo.root.join("calls")).unwrap();
+        assert_eq!(calls.lines().filter(|call| *call == "ls-remote").count(), 1);
+    }
+
+    #[test]
+    fn terminal_progress_keeps_a_static_status_when_relay_preparation_fails() {
+        let repo = Repo::new();
+        repo.git(&["branch", "merged"]);
+        let mut command = repo.cli();
+        command
+            .args(["br", "--dry-run"])
+            .env("TMPDIR", repo.root.join("missing-directory"));
+        let output = in_terminal(&command);
+        assert_success(&output);
+        let display = text(&output.stdout);
+        assert!(
+            display.contains("Checking origin's default branch and latest commit...\r\n"),
+            "{display}"
+        );
+        assert!(display.ends_with("candidate: merged"), "{display}");
+        assert!(repo.exists("merged"));
     }
 
     #[test]
@@ -1346,7 +1394,9 @@ mod unix {
             command.arg("--dry-run");
             let output = in_terminal(&command);
             assert_success(&output);
-            let display = text(&output.stdout);
+            // Nested terminal output can pass through ONLCR twice. Repeated
+            // carriage returns have the same visible effect as a single one.
+            let display = text(&output.stdout).replace("\r\r\n", "\r\n");
             let after_diagnostic = display.split_once("remote diagnostic").unwrap().1;
             assert!(
                 after_diagnostic.starts_with("\r\n\r\x1b[2K⠋ Checking merged branches..."),
@@ -1368,7 +1418,7 @@ mod unix {
                 "if [ \"$1\" = ls-remote ]; then printf '{diagnostic}' >&2; sleep 0.3; exit 23; fi"
             );
             let output = in_terminal(&shim(&repo, &hook));
-            let display = text(&output.stdout);
+            let display = text(&output.stdout).replace("\r\r\n", "\r\n");
             let after_diagnostic = display.split_once("remote diagnostic").unwrap().1;
             assert_eq!(
                 after_diagnostic, "\r\ngiclean: git ls-remote failed (exit status: 23)",
