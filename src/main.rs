@@ -8,6 +8,8 @@ mod bulk;
 mod git;
 mod progress;
 mod ssh;
+#[cfg(unix)]
+mod terminal;
 
 use progress::Progress;
 
@@ -152,9 +154,12 @@ fn git_command_text(
     operation: &str,
     progress: &Progress,
 ) -> Result<String, String> {
-    let output = progress
-        .output(&mut command)
-        .map_err(|e| format!("could not run git {operation}: {e}"))?;
+    let output = if operation == "ls-remote" {
+        progress.remote_output(&mut command)
+    } else {
+        progress.output(&mut command)
+    }
+    .map_err(|e| format!("could not run git {operation}: {e}"))?;
     if !output.status.success() {
         return Err(format!("git {operation} failed ({})", output.status));
     }
@@ -563,7 +568,6 @@ fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<ExitCode, Strin
     // Require a configured remote, rather than accidentally treating "origin" as a path.
     progress.update("Checking origin's default branch and latest commit...");
     let origin = git_text(&["remote", "get-url", "origin"], &progress)?;
-    progress.pause_for_input();
     let mut query = git(&[]);
     ssh::configure(&mut query, origin.trim());
     query.args(["ls-remote", "--symref", "--exit-code", "origin", "HEAD"]);

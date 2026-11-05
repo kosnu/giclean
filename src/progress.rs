@@ -70,10 +70,26 @@ impl Progress {
         }
     }
 
-    // Git, SSH, and credential helpers can write prompts directly to /dev/tty.
-    // Stop drawing before starting any operation that can ask for input.
-    pub fn pause_for_input(&self) {
-        self.suspend();
+    pub fn remote_output(&self, command: &mut Command) -> io::Result<Output> {
+        if self.display.is_none() {
+            return self.output(command);
+        }
+        #[cfg(unix)]
+        if let Ok(mut remote) = crate::terminal::Remote::prepare(command) {
+            let mut output = self.output(&mut remote.command)?;
+            output.stdout = std::fs::read(remote.stdout())?;
+            return Ok(output);
+        }
+        // Without a PTY relay, leave the status visible on its own line so
+        // direct /dev/tty prompts cannot be overwritten by animation.
+        if let Some(display) = &self.display {
+            let mut display = display.lock().unwrap();
+            if display.visible {
+                eprintln!();
+                display.visible = false;
+            }
+        }
+        self.output(command)
     }
 
     // Clear the progress line for stdout and child diagnostics.
