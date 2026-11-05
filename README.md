@@ -41,6 +41,9 @@ giclean --version
 ```sh
 giclean br --dry-run  # 削除候補を確認
 giclean br            # 確認なしで削除
+giclean wt -d 3 --dry-run  # マージ後3日以上アクティビティのない worktree を確認
+giclean wt -d 3            # 対象の worktree を削除
+giclean wt -h 12           # 待機時間を12時間に指定
 giclean --help
 ```
 
@@ -49,8 +52,13 @@ giclean --help
 `main` / `master` / `production`、既定ブランチ、使用中のブランチは保持します。
 自動 fetch は行いません。最新コミットが未取得の場合は `git fetch origin` 後に再実行してください。
 
+`wt` は、GitHub の PR マージ日時と worktree の最終更新日時のうち、新しい方から指定時間が経過した linked worktree を削除します。マージ後にファイルの更新や Git 操作があれば、その時点から数え直します。通常のマージ・squash・fast-forward に対応し、取り込み済みかどうかも Git で検査します。
+
+`wt` には、github.com の `origin` と認証済みの [GitHub CLI (`gh`)](https://cli.github.com/) が必要です。マージ日時が不明なもの、現在の worktree、主 worktree、ロック済み、未コミット変更・未追跡ファイル・ignored ファイルがあるものは保持します。ブランチ自体は削除しません。読み取りだけの利用はアクティビティとして検出できません。詳しい判定条件は [wt の仕様](docs/commands/wt.md)を参照してください。
+
 ## ドキュメント
 
 - [br の仕様・出力・制約](docs/commands/br.md)
+- [wt の仕様・出力・制約](docs/commands/wt.md)
 - [設計・SSH 接続・背景資料](docs/design.md)
 - [開発・検証手順](CONTRIBUTING.md)
