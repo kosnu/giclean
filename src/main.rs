@@ -10,6 +10,7 @@ mod progress;
 mod ssh;
 #[cfg(unix)]
 mod terminal;
+mod worktrees;
 
 use progress::Progress;
 
@@ -19,6 +20,7 @@ Usage: giclean <command> [options]
 
 Commands:
   br             Delete merged local branches
+  wt             Delete inactive merged worktrees
 
 Options:
   -h, --help     Show help
@@ -46,9 +48,16 @@ Does not fetch automatically. GitHub CLI is not required.
 const BRANCH_FORMAT: &str = "--format=%(refname)%09%(objectname)%09%(HEAD)%09%(if)%(worktreepath)%(then)used%(else)free%(end)%09%(symref)";
 
 enum Action {
-    Branches { dry_run: bool },
+    Branches {
+        dry_run: bool,
+    },
+    Worktrees {
+        age: std::time::Duration,
+        dry_run: bool,
+    },
     Help,
     BranchesHelp,
+    WorktreesHelp,
     Version,
 }
 
@@ -94,10 +103,14 @@ fn main() -> ExitCode {
         Action::BranchesHelp => write!(out, "{BRANCHES_HELP}")
             .map(|()| ExitCode::SUCCESS)
             .map_err(|e| e.to_string()),
+        Action::WorktreesHelp => write!(out, "{}", worktrees::HELP)
+            .map(|()| ExitCode::SUCCESS)
+            .map_err(|e| e.to_string()),
         Action::Version => writeln!(out, "giclean {}", env!("CARGO_PKG_VERSION"))
             .map(|()| ExitCode::SUCCESS)
             .map_err(|e| e.to_string()),
         Action::Branches { dry_run } => clean_branches(dry_run, &mut out),
+        Action::Worktrees { age, dry_run } => worktrees::clean(age, dry_run, &mut out),
     };
     match result.and_then(|status| out.flush().map(|()| status).map_err(|e| e.to_string())) {
         Ok(status) => status,
@@ -121,6 +134,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Action, String> {
         [command, option] if command == "br" && (option == "--help" || option == "-h") => {
             Ok(Action::BranchesHelp)
         }
+        [command, options @ ..] if command == "wt" => worktrees::parse_args(options),
         _ => Err(format!(
             "invalid arguments: {}",
             args.iter()
@@ -551,6 +565,31 @@ fn parse_remote_head(output: &str) -> Result<RemoteHead, String> {
     }
 }
 
+fn latest_remote_head(progress: &Progress) -> Result<RemoteHead, String> {
+    // Require a configured remote, rather than accidentally treating "origin" as a path.
+    progress.update("Checking origin's default branch and latest commit...");
+    let origin = git_text(&["remote", "get-url", "origin"], progress)?;
+    let mut query = git(&[]);
+    ssh::configure(&mut query, origin.trim());
+    query.args(["ls-remote", "--symref", "--exit-code", "origin", "HEAD"]);
+    let remote = parse_remote_head(&git_command_text(query, "ls-remote", progress)?)?;
+    git_text(
+        &["check-ref-format", &format!("refs/heads/{}", remote.branch)],
+        progress,
+    )?;
+    let commit = git(&["cat-file", "-t", &remote.oid])
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("could not check the target commit: {e}"))?;
+    if !commit.status.success() || commit.stdout != b"commit\n" {
+        return Err(format!(
+            "the latest commit of origin/{} ({}) is not available locally; run git fetch origin and retry",
+            remote.branch, remote.oid
+        ));
+    }
+    Ok(remote)
+}
+
 fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<ExitCode, String> {
     let progress = Progress::start("Checking local branches...");
     if git_text(&["rev-parse", "--is-inside-work-tree"], &progress)?.trim() != "true" {
@@ -565,27 +604,7 @@ fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<ExitCode, Strin
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Require a configured remote, rather than accidentally treating "origin" as a path.
-    progress.update("Checking origin's default branch and latest commit...");
-    let origin = git_text(&["remote", "get-url", "origin"], &progress)?;
-    let mut query = git(&[]);
-    ssh::configure(&mut query, origin.trim());
-    query.args(["ls-remote", "--symref", "--exit-code", "origin", "HEAD"]);
-    let remote = parse_remote_head(&git_command_text(query, "ls-remote", &progress)?)?;
-    git_text(
-        &["check-ref-format", &format!("refs/heads/{}", remote.branch)],
-        &progress,
-    )?;
-    let commit = git(&["cat-file", "-t", &remote.oid])
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| format!("could not check the target commit: {e}"))?;
-    if !commit.status.success() || commit.stdout != b"commit\n" {
-        return Err(format!(
-            "the latest commit of origin/{} ({}) is not available locally; run git fetch origin and retry",
-            remote.branch, remote.oid
-        ));
-    }
+    let remote = latest_remote_head(&progress)?;
     progress.update("Checking merged branches...");
     let mut merged = branch_snapshot(Some(&remote.oid), None, &progress)?;
     let tips: BTreeSet<_> = initial
