@@ -48,9 +48,10 @@ Git 2.47 以降に加え、認証済みの [GitHub CLI (`gh`)](https://cli.githu
 - `main` / `master` / `production` / `origin` の既定ブランチ、symbolic なローカル参照。
 - ロック済み、detached HEAD、prunable なもの。
 - 未コミット変更、ステージ済み変更、未追跡ファイル、ignored ファイルがあるもの。
+- index に `assume-unchanged` / `skip-worktree` のエントリがあるもの。`git status` が変更を表示しない可能性があるため、実際に変更がなくても保持します。index のフラグは変更しません。
 - merge・rebase・cherry-pick・revert・bisect などの操作状態、Git の HEAD/index ロックが残るもの。
 
-全候補の初期検査を終えてから削除を開始します。各操作直前に一覧・先端・ブランチ・ロック・ローカル変更・更新時刻を再検査し、変わっていれば保持します。削除には強制オプションなしの `git worktree remove -- <path>` を使います。[Git の worktree remove](https://git-scm.com/docs/git-worktree#Documentation/git-worktree.txt-remove)が作業ディレクトリと登録情報を削除します。
+全候補の初期検査を終えてから削除を開始します。初期検査と各操作直前の両方で、`git ls-files --cached -v -z` による index フラグの検査を行います。照会失敗・不正な応答は削除中止とします。各操作直前に一覧・先端・ブランチ・ロック・ローカル変更・更新時刻も再検査し、変わっていれば保持します。削除には強制オプションなしの `git worktree remove -- <path>` を使います。[Git の worktree remove](https://git-scm.com/docs/git-worktree#Documentation/git-worktree.txt-remove)が作業ディレクトリと登録情報を削除します。
 
 再確認と削除は原子的ではありません。最終確認後の同時操作を完全には防げないため、別プロセスからの書き込みと同時に実行しないでください。特に Git 自体は ignored ファイルの削除を拒否しないため、独自の直前検査で保護しています。
 

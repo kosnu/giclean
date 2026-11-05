@@ -289,6 +289,193 @@ fn wt_protects_all_local_changes_and_in_progress_operations_even_if_old() {
 }
 
 #[test]
+fn wt_preserves_worktrees_with_hidden_changes_without_modifying_index_flags() {
+    for flags in [
+        &["--assume-unchanged"][..],
+        &["--skip-worktree"][..],
+        &["--assume-unchanged", "--skip-worktree"][..],
+    ] {
+        for changed in [false, true] {
+            let repo = Repo::wt();
+            let (tip, merged, tree) = repo.topic("topic", Some("merge"));
+            repo.pr(&tip, "topic", &merged, old_time());
+            for flag in flags {
+                checked(repo.git_command().current_dir(&tree).args([
+                    "update-index",
+                    flag,
+                    "--",
+                    "topic",
+                ]));
+            }
+            let content = if changed {
+                "hidden local data\n"
+            } else {
+                "topic\n"
+            };
+            fs::write(tree.join("topic"), content).unwrap();
+            assert!(
+                checked(repo.git_command().current_dir(&tree).args([
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                ]))
+                .stdout
+                .is_empty()
+            );
+            repo.age_tree(&tree);
+            let git_dir = PathBuf::from(text(
+                &checked(
+                    repo.git_command()
+                        .current_dir(&tree)
+                        .args(["rev-parse", "--absolute-git-dir"]),
+                )
+                .stdout,
+            ));
+            let before = fs::read(git_dir.join("index")).unwrap();
+            let before_time = fs::metadata(git_dir.join("index"))
+                .unwrap()
+                .modified()
+                .unwrap();
+            for args in [&["wt", "-d", "3", "--dry-run"][..], &["wt", "-d", "3"][..]] {
+                let output = checked(repo.wt_cli().args(args));
+                assert!(output.stdout.is_empty(), "{flags:?}, changed={changed}");
+                assert_eq!(fs::read_to_string(tree.join("topic")).unwrap(), content);
+                assert_eq!(fs::read(git_dir.join("index")).unwrap(), before);
+                assert_eq!(
+                    fs::metadata(git_dir.join("index"))
+                        .unwrap()
+                        .modified()
+                        .unwrap(),
+                    before_time
+                );
+            }
+            assert!(!repo.root.join("gh-calls").exists());
+        }
+    }
+}
+
+#[test]
+fn wt_rechecks_index_flags_even_when_hidden_changes_and_index_are_old() {
+    for flags in [
+        "--assume-unchanged",
+        "--skip-worktree",
+        "--assume-unchanged --skip-worktree",
+    ] {
+        for dry_run in [true, false] {
+            let repo = Repo::wt();
+            let (tip, merged, tree) = repo.topic("a", Some("merge"));
+            repo.pr(&tip, "a", &merged, old_time());
+            let (other, other_merged, other_tree) = repo.topic("z", Some("merge"));
+            repo.pr(&other, "z", &other_merged, old_time());
+            let git_dir = PathBuf::from(text(
+                &checked(
+                    repo.git_command()
+                        .current_dir(&tree)
+                        .args(["rev-parse", "--absolute-git-dir"]),
+                )
+                .stdout,
+            ));
+            let reference = repo.root.join("old-time");
+            fs::write(&reference, "").unwrap();
+            set_time(&reference, old_time());
+            // The later PR lookup runs after a was admitted as a candidate.
+            // Restore all modified mtimes so only the flag check can protect a.
+            let action = format!(
+                "git -C {} update-index {flags} -- a\nprintf 'hidden local data\\n' > {}\ntouch -r {} {} {} {}",
+                quote(&tree),
+                quote(&tree.join("a")),
+                quote(&reference),
+                quote(&tree.join("a")),
+                quote(&git_dir.join("index")),
+                quote(&git_dir),
+            );
+            fs::write(repo.root.join("gh-action"), format!(
+                "set -eu\ncase $(/bin/cat \"$TEST_GH_ROOT/gh-calls\") in *{other}*) {action};; esac\n",
+            )).unwrap();
+            let mut command = repo.wt_cli();
+            command.args(["wt", "-d", "3"]);
+            if dry_run {
+                command.arg("--dry-run");
+            }
+            let output = checked(&mut command);
+            assert!(
+                !text(&output.stdout).contains(tree.to_str().unwrap()),
+                "{flags}, dry_run={dry_run}"
+            );
+            assert_eq!(
+                fs::read_to_string(tree.join("a")).unwrap(),
+                "hidden local data\n"
+            );
+            assert!(
+                fs::metadata(git_dir.join("index"))
+                    .unwrap()
+                    .modified()
+                    .unwrap()
+                    < SystemTime::now() - Duration::from_secs(3 * 86400)
+            );
+            assert_eq!(other_tree.exists(), dry_run);
+        }
+    }
+}
+
+#[test]
+fn wt_index_flag_query_errors_and_malformed_records_stop_deletion() {
+    for response in [
+        None,
+        Some(&b"Q topic\0"[..]),
+        Some(&b"H topic"[..]),
+        Some(&b"H \0"[..]),
+        Some(&b"h topic\0Q other\0"[..]),
+    ] {
+        let repo = Repo::wt();
+        let (tip, merged, tree) = repo.topic("topic", Some("merge"));
+        repo.pr(&tip, "topic", &merged, old_time());
+        let response_file = repo.root.join("index-response");
+        if let Some(response) = response {
+            fs::write(&response_file, response).unwrap();
+        }
+        let action = if response.is_some() {
+            format!("/bin/cat {}; exit 0", quote(&response_file))
+        } else {
+            "echo 'test index query failure' >&2; exit 1".into()
+        };
+        repo.git_wrapper(&format!("case \"$*\" in *' ls-files '*) {action};; esac"));
+        for args in [&["wt", "-d", "3", "--dry-run"][..], &["wt", "-d", "3"][..]] {
+            let output = repo.wt_cli().args(args).output().unwrap();
+            assert_eq!(output.status.code(), Some(1), "{response:?}");
+            assert!(output.stdout.is_empty());
+            assert!(text(&output.stderr).contains("index flags"));
+            assert!(tree.join("topic").exists());
+        }
+    }
+}
+
+#[test]
+fn wt_index_flag_inspection_handles_literal_filenames() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let repo = Repo::wt();
+    let mut name = b"h name with spaces\nS another".to_vec();
+    // macOS filesystems reject non-UTF-8 filenames; Linux can exercise those too.
+    if cfg!(target_os = "linux") {
+        name.push(0xff);
+    }
+    let name = OsString::from_vec(name);
+    fs::write(repo.work.join(name), "tracked\n").unwrap();
+    repo.git(&["add", "--all"]);
+    repo.git(&["commit", "-m", "literal filename"]);
+    let (tip, merged, tree) = repo.topic("topic", Some("merge"));
+    repo.pr(&tip, "topic", &merged, old_time());
+    assert!(
+        !checked(repo.wt_cli().args(["wt", "-d", "3", "--dry-run"]))
+            .stdout
+            .is_empty()
+    );
+    checked(repo.wt_cli().args(["wt", "-d", "3"]));
+    assert!(!tree.exists());
+}
+
+#[test]
 fn wt_keeps_locked_current_detached_primary_and_protected_branch_worktrees() {
     let repo = Repo::wt();
     let (tip, merged, tree) = repo.topic("topic", Some("merge"));

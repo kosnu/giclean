@@ -257,6 +257,30 @@ fn clean_worktree(path: &Path, progress: &Progress) -> Result<bool, String> {
             Err(e) => return Err(format!("cannot inspect Git operation state: {e}")),
         }
     }
+    // An empty status is not proof of a clean worktree when index flags suppress
+    // change detection. Preserve those worktrees without modifying their index.
+    let indexed = progress
+        .output(&mut at(path, &["ls-files", "--cached", "-v", "-z"]))
+        .map_err(|e| format!("could not inspect worktree index flags: {e}"))?;
+    if !indexed.status.success() {
+        return Err("could not inspect worktree index flags".into());
+    }
+    let mut inspectable = true;
+    for entry in indexed.stdout.split_inclusive(|byte| *byte == 0) {
+        if entry.len() < 4 || entry[1] != b' ' || entry.last() != Some(&0) {
+            return Err("cannot parse worktree index flags".into());
+        }
+        // --cached -v reports H for ordinary entries, S for skip-worktree,
+        // and M for unmerged entries; lowercase means assume-unchanged.
+        match entry[0] {
+            b'H' => {}
+            b'h' | b'S' | b's' | b'M' | b'm' => inspectable = false,
+            _ => return Err("cannot parse worktree index flags".into()),
+        }
+    }
+    if !inspectable {
+        return Ok(false);
+    }
     // Git normally permits deleting ignored files. Include them here so no
     // local-only files are discarded, even when their timestamps are old.
     let status = git_command_text(
