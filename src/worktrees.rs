@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::decision::{Decision, Outcome, ReasonCode, RunReport, Target, record_outcome};
 use crate::{Action, git, git_command_text, git_text, progress::Progress, valid_oid};
 
 pub const HELP: &str = "giclean wt — Delete inactive merged worktrees
@@ -64,7 +65,7 @@ struct Worktree {
     path: PathBuf,
     oid: String,
     branch: Option<String>,
-    protected: bool,
+    protection: Option<ReasonCode>,
 }
 
 fn snapshot(progress: &Progress) -> Result<Vec<Worktree>, String> {
@@ -83,7 +84,7 @@ fn snapshot(progress: &Progress) -> Result<Vec<Worktree>, String> {
             path: PathBuf::from(path),
             oid: String::new(),
             branch: None,
-            protected: worktrees.is_empty(),
+            protection: worktrees.is_empty().then_some(ReasonCode::MainWorktree),
         };
         let mut ended = false;
         for field in fields.by_ref() {
@@ -96,7 +97,9 @@ fn snapshot(progress: &Progress) -> Result<Vec<Worktree>, String> {
                 if !worktree.oid.is_empty() || (!valid_oid(oid) && !unborn) {
                     return Err("cannot parse worktree HEAD".into());
                 }
-                worktree.protected |= unborn;
+                if unborn {
+                    worktree.protection.get_or_insert(ReasonCode::UnbornHead);
+                }
                 worktree.oid = oid.into();
             } else if let Some(branch) = field.strip_prefix("branch refs/heads/") {
                 if branch.is_empty() || worktree.branch.replace(branch.into()).is_some() {
@@ -106,12 +109,21 @@ fn snapshot(progress: &Progress) -> Result<Vec<Worktree>, String> {
                 || field.starts_with("locked ")
                 || field.starts_with("prunable ")
             {
-                worktree.protected = true;
+                let reason = if field == "detached" {
+                    ReasonCode::DetachedHead
+                } else if field == "bare" {
+                    ReasonCode::BareWorktree
+                } else if field.starts_with("locked") {
+                    ReasonCode::LockedWorktree
+                } else {
+                    ReasonCode::PrunableWorktree
+                };
+                worktree.protection.get_or_insert(reason);
             } else {
                 return Err("cannot parse worktree state".into());
             }
         }
-        if !ended || (worktree.oid.is_empty() && !worktree.protected) {
+        if !ended || (worktree.oid.is_empty() && worktree.protection.is_none()) {
             return Err("incomplete worktree state".into());
         }
         worktrees.push(worktree);
@@ -237,7 +249,7 @@ fn at(path: &Path, args: &[&str]) -> Command {
     command
 }
 
-fn clean_worktree(path: &Path, progress: &Progress) -> Result<bool, String> {
+fn worktree_safety(path: &Path, progress: &Progress) -> Result<Option<ReasonCode>, String> {
     let git_dir = private_git_dir(path, progress)?;
     for marker in [
         "MERGE_HEAD",
@@ -252,7 +264,7 @@ fn clean_worktree(path: &Path, progress: &Progress) -> Result<bool, String> {
         "HEAD.lock",
     ] {
         match fs::symlink_metadata(git_dir.join(marker)) {
-            Ok(_) => return Ok(false),
+            Ok(_) => return Ok(Some(ReasonCode::GitOperation)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("cannot inspect Git operation state: {e}")),
         }
@@ -279,7 +291,7 @@ fn clean_worktree(path: &Path, progress: &Progress) -> Result<bool, String> {
         }
     }
     if !inspectable {
-        return Ok(false);
+        return Ok(Some(ReasonCode::IndexFlags));
     }
     // Git normally permits deleting ignored files. Include them here so no
     // local-only files are discarded, even when their timestamps are old.
@@ -298,7 +310,7 @@ fn clean_worktree(path: &Path, progress: &Progress) -> Result<bool, String> {
         "status",
         progress,
     )?;
-    Ok(status.is_empty())
+    Ok((!status.is_empty()).then_some(ReasonCode::LocalChanges))
 }
 
 fn modified(path: &Path) -> Result<SystemTime, String> {
@@ -359,7 +371,150 @@ fn activity(path: &Path, progress: &Progress) -> Result<SystemTime, String> {
         .max(modified(&path.join(".git"))?))
 }
 
-pub fn clean(age: Duration, dry_run: bool, out: &mut impl Write) -> Result<ExitCode, String> {
+struct WorktreeInspection {
+    entries: Vec<(Worktree, Decision)>,
+    cutoff: Option<SystemTime>,
+}
+
+fn inspect_worktrees(
+    age: Duration,
+    current: &Path,
+    progress: &Progress,
+    report: &mut RunReport,
+) -> Result<WorktreeInspection, String> {
+    let mut entries: Vec<_> = snapshot(progress)?
+        .into_iter()
+        .map(|tree| {
+            let reason = if let Some(reason) = tree.protection {
+                reason
+            } else if tree
+                .branch
+                .as_deref()
+                .is_none_or(|branch| matches!(branch, "main" | "master" | "production"))
+            {
+                ReasonCode::ProtectedBranch
+            } else {
+                match fs::canonicalize(&tree.path) {
+                    Ok(path) if path == current => ReasonCode::CurrentWorktree,
+                    Ok(_) => ReasonCode::NotInspected,
+                    Err(_) => ReasonCode::PathUnavailable,
+                }
+            };
+            let decision = Decision::new(
+                Target::Worktree {
+                    path: tree.path.clone(),
+                    branch: tree.branch.clone(),
+                    oid: tree.oid.clone(),
+                },
+                reason,
+            );
+            (tree, decision)
+        })
+        .collect();
+    for (_, decision) in &entries {
+        report.record(decision.clone());
+    }
+    if !entries
+        .iter()
+        .any(|(_, d)| d.reason == ReasonCode::NotInspected)
+    {
+        return Ok(WorktreeInspection {
+            entries,
+            cutoff: None,
+        });
+    }
+    let url = git_text(&["config", "--get", "remote.origin.url"], progress)?;
+    let repo = github_repo(url.trim())?;
+    let remote = crate::latest_remote_head(progress)?;
+    let cutoff = SystemTime::now()
+        .checked_sub(age)
+        .ok_or("requested waiting period exceeds the system clock range")?;
+    progress.update("Checking PR merge times and worktree activity...");
+    let branches = crate::branch_snapshot(None, None, progress)?;
+    // Finish all initial eligibility checks before deleting anything.
+    for (tree, decision) in &mut entries {
+        if decision.reason != ReasonCode::NotInspected {
+            continue;
+        }
+        decision.evidence.cutoff = Some(cutoff);
+        let result = inspect_worktree(tree, &branches, &repo, &remote, cutoff, progress, decision);
+        match result {
+            Ok(reason) => decision.revise(reason),
+            Err(error) => {
+                decision.inspection_failed(error.clone());
+                report.record(decision.clone());
+                return Err(error);
+            }
+        }
+        report.record(decision.clone());
+    }
+    Ok(WorktreeInspection {
+        entries,
+        cutoff: Some(cutoff),
+    })
+}
+
+fn inspect_worktree(
+    tree: &Worktree,
+    branches: &std::collections::BTreeMap<String, crate::Branch>,
+    repo: &str,
+    remote: &crate::RemoteHead,
+    cutoff: SystemTime,
+    progress: &Progress,
+    decision: &mut Decision,
+) -> Result<ReasonCode, String> {
+    let branch = tree
+        .branch
+        .as_deref()
+        .expect("unprotected worktree has a branch");
+    if branch == remote.branch {
+        return Ok(ReasonCode::DefaultBranch);
+    }
+    let Some(branch) = branches.get(branch) else {
+        return Ok(ReasonCode::TargetMissing);
+    };
+    if branch.symbolic {
+        return Ok(ReasonCode::SymbolicBranch);
+    }
+    if branch.oid != tree.oid {
+        return Ok(ReasonCode::StateChanged);
+    }
+    if let Some(reason) = worktree_safety(&tree.path, progress)? {
+        return Ok(reason);
+    }
+    let merged_at = merge_time(tree, repo, remote, progress)?;
+    decision.evidence.merged_at = merged_at;
+    let Some(merged_at) = merged_at else {
+        return Ok(ReasonCode::NoVerifiedMerge);
+    };
+    if merged_at > cutoff {
+        return Ok(ReasonCode::WaitingPeriod);
+    }
+    let latest_activity = activity(&tree.path, progress)?;
+    decision.evidence.latest_activity = Some(latest_activity);
+    if latest_activity > cutoff {
+        return Ok(ReasonCode::RecentActivity);
+    }
+    Ok(ReasonCode::InactiveMerged)
+}
+
+pub fn clean(
+    age: Duration,
+    dry_run: bool,
+    out: &mut impl Write,
+    report: &mut RunReport,
+) -> Result<ExitCode, String> {
+    let result = execute(age, dry_run, out, report);
+    report.finish(&result);
+    result
+}
+
+fn execute(
+    age: Duration,
+    dry_run: bool,
+    out: &mut impl Write,
+    report: &mut RunReport,
+) -> Result<ExitCode, String> {
     let progress = Progress::start("Checking worktrees...");
     if git_text(&["rev-parse", "--is-inside-work-tree"], &progress)?.trim() != "true" {
         return Err("run this command inside a Git working tree".into());
@@ -371,47 +526,11 @@ pub fn clean(age: Duration, dry_run: bool, out: &mut impl Write) -> Result<ExitC
             .ok_or("cannot find current worktree")?,
     )
     .map_err(|e| e.to_string())?;
-    let initial: Vec<_> = snapshot(&progress)?
-        .into_iter()
-        .filter(|tree| {
-            !tree.protected
-                && tree
-                    .branch
-                    .as_deref()
-                    .is_some_and(|branch| !matches!(branch, "main" | "master" | "production"))
-                && fs::canonicalize(&tree.path).is_ok_and(|path| path != current)
-        })
-        .collect();
-    if initial.is_empty() {
+    let inspection = inspect_worktrees(age, &current, &progress, report)?;
+    let cutoff = inspection.cutoff;
+    if cutoff.is_none() {
         progress.finish();
         return Ok(ExitCode::SUCCESS);
-    }
-    let url = git_text(&["config", "--get", "remote.origin.url"], &progress)?;
-    let repo = github_repo(url.trim())?;
-    let remote = crate::latest_remote_head(&progress)?;
-    let cutoff = SystemTime::now()
-        .checked_sub(age)
-        .ok_or("requested waiting period exceeds the system clock range")?;
-    progress.update("Checking PR merge times and worktree activity...");
-    let branches = crate::branch_snapshot(None, None, &progress)?;
-    let mut candidates = Vec::new();
-    // Finish all initial eligibility checks before deleting anything.
-    for tree in initial {
-        let branch = tree.branch.as_deref().unwrap();
-        if branch == remote.branch
-            || branches
-                .get(branch)
-                .is_none_or(|b| b.symbolic || b.oid != tree.oid)
-            || !clean_worktree(&tree.path, &progress)?
-        {
-            continue;
-        }
-        let merged_at = merge_time(&tree, &repo, &remote, &progress)?;
-        if merged_at.is_some_and(|time| time <= cutoff)
-            && activity(&tree.path, &progress)? <= cutoff
-        {
-            candidates.push(tree);
-        }
     }
     progress.update(if dry_run {
         "Checking deletion candidates..."
@@ -419,17 +538,44 @@ pub fn clean(age: Duration, dry_run: bool, out: &mut impl Write) -> Result<ExitC
         "Deleting worktrees..."
     });
     let mut failed = false;
-    for tree in candidates {
-        let latest = snapshot(&progress)?;
-        if !latest.iter().any(|current| current == &tree)
-            || !clean_worktree(&tree.path, &progress)?
-            || activity(&tree.path, &progress)? > cutoff
-        {
+    for (tree, initial_decision) in &inspection.entries {
+        let decision = report
+            .decisions
+            .iter_mut()
+            .find(|d| d.target == initial_decision.target)
+            .expect("inspected worktree has a decision");
+        if !decision.is_deletable() {
             continue;
+        }
+        let recheck: Result<Option<ReasonCode>, String> = (|| {
+            let latest = snapshot(&progress)?;
+            if !latest.iter().any(|current| current == tree) {
+                return Ok(Some(ReasonCode::StateChanged));
+            }
+            if let Some(reason) = worktree_safety(&tree.path, &progress)? {
+                return Ok(Some(reason));
+            }
+            let latest_activity = activity(&tree.path, &progress)?;
+            decision.evidence.latest_activity = Some(latest_activity);
+            Ok((Some(latest_activity) > cutoff).then_some(ReasonCode::RecentActivity))
+        })();
+        match recheck {
+            Ok(Some(reason)) => {
+                decision.revise(reason);
+                record_outcome(&mut report.results, &decision.target, Outcome::Skipped);
+                continue;
+            }
+            Ok(None) => decision.revise(decision.reason),
+            Err(error) => {
+                decision.inspection_failed(error.clone());
+                return Err(error);
+            }
         }
         progress.suspend();
         if dry_run {
-            writeln!(out, "candidate: {}", tree.path.display()).map_err(|e| e.to_string())?;
+            record_outcome(&mut report.results, &decision.target, Outcome::Candidate);
+            writeln!(out, "{}", crate::render::candidate(tree.path.display()))
+                .map_err(|e| e.to_string())?;
             continue;
         }
         let output = git(&["worktree", "remove", "--"])
@@ -438,7 +584,9 @@ pub fn clean(age: Duration, dry_run: bool, out: &mut impl Write) -> Result<ExitC
             .output();
         match output {
             Ok(output) if output.status.success() => {
-                writeln!(out, "{}: deleted", tree.path.display()).map_err(|e| e.to_string())?;
+                record_outcome(&mut report.results, &decision.target, Outcome::Deleted);
+                writeln!(out, "{}", crate::render::deleted(tree.path.display()))
+                    .map_err(|e| e.to_string())?;
             }
             result => {
                 failed = true;
@@ -450,8 +598,17 @@ pub fn clean(age: Duration, dry_run: bool, out: &mut impl Write) -> Result<ExitC
                     ),
                     Err(error) => format!("could not run git: {error}"),
                 };
-                writeln!(out, "{}: failed ({reason})", tree.path.display())
-                    .map_err(|e| e.to_string())?;
+                record_outcome(
+                    &mut report.results,
+                    &decision.target,
+                    Outcome::Failed(reason.clone()),
+                );
+                writeln!(
+                    out,
+                    "{}",
+                    crate::render::failed(tree.path.display(), reason)
+                )
+                .map_err(|e| e.to_string())?;
             }
         }
     }
