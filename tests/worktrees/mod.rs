@@ -787,3 +787,105 @@ fn wt_missing_latest_remote_commit_fails_without_fetch_or_deletion() {
 }
 
 mod explain;
+
+#[test]
+fn json_wt_escapes_paths_and_reports_preview_and_deletion() {
+    let repo = Repo::wt();
+    let (tip, merged, tree) = repo.topic("topic", Some("merge"));
+    repo.pr(&tip, "topic", &merged, old_time());
+    let unusual = repo.root.join("日本語 \"quote\" \\ slash\n\tpath");
+    checked(
+        repo.git_command()
+            .args(["worktree", "move"])
+            .arg(&tree)
+            .arg(&unusual),
+    );
+    repo.age_tree(&unusual);
+    for dry_run in [true, false] {
+        let mut command = repo.wt_cli();
+        command.args(["wt", "-d", "3", "--format", "json"]);
+        if dry_run {
+            command.arg("--dry-run");
+        }
+        let output = checked(&mut command);
+        let document = json_support::parse(&output.stdout);
+        assert_eq!(document.get("command").string(), "wt");
+        assert_eq!(document.get("success"), &json_support::Json::Bool(true));
+        let result = document
+            .get("executions")
+            .array()
+            .iter()
+            .find(|r| r.get("target").get("path").string() == unusual.to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            result.get("outcome").string(),
+            if dry_run { "candidate" } else { "deleted" }
+        );
+        assert_eq!(unusual.exists(), dry_run);
+    }
+    assert!(repo.exists("topic"));
+}
+
+#[test]
+fn json_wt_partial_failure_and_query_error_preserve_valid_stdout() {
+    let repo = Repo::wt();
+    let (tip, merged, tree) = repo.topic("a", Some("merge"));
+    repo.pr(&tip, "a", &merged, old_time());
+    let (tip, merged, other) = repo.topic("z", Some("merge"));
+    repo.pr(&tip, "z", &merged, old_time());
+    repo.git_wrapper("case \"$*\" in *'worktree remove -- '*'tree a') echo 'test removal failure' >&2; exit 1;; esac");
+    let output = repo
+        .wt_cli()
+        .args(["wt", "-d", "3", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let document = json_support::parse(&output.stdout);
+    assert_eq!(document.get("success"), &json_support::Json::Bool(false));
+    assert!(
+        document
+            .get("executions")
+            .array()
+            .iter()
+            .any(|r| r.get("outcome").string() == "failed")
+    );
+    assert!(
+        document
+            .get("executions")
+            .array()
+            .iter()
+            .any(|r| r.get("outcome").string() == "deleted")
+    );
+    assert!(tree.exists());
+    assert!(!other.exists());
+    fs::write(repo.root.join("gh-fail"), "").unwrap();
+    let output = repo
+        .wt_cli()
+        .args(["wt", "-d", "3", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let document = json_support::parse(&output.stdout);
+    assert_eq!(document.get("error").get("code").string(), "cleanup_failed");
+    assert!(tree.exists());
+}
+
+#[test]
+fn json_and_explain_worktree_output_stays_json() {
+    let repo = Repo::wt();
+    let (tip, merged, tree) = repo.topic("topic", Some("merge"));
+    repo.pr(&tip, "topic", &merged, old_time());
+    let output = checked(repo.wt_cli().args([
+        "wt",
+        "--format",
+        "json",
+        "-d",
+        "3",
+        "--explain",
+        "--dry-run",
+    ]));
+    let document = json_support::parse(&output.stdout);
+    assert_eq!(document.get("success"), &json_support::Json::Bool(true));
+    assert!(!text(&output.stdout).contains("explain:"));
+    assert!(tree.exists());
+}

@@ -62,3 +62,7 @@ giclean --help
 - [wt の仕様・出力・制約](docs/commands/wt.md)
 - [設計・SSH 接続・背景資料](docs/design.md)
 - [開発・検証手順](CONTRIBUTING.md)
+
+## JSON 出力
+
+`--format json` で判定理由と実行結果を機械可読形式で出力できます。`--dry-run` と併用できます。仕様と互換性方針は [JSON 出力](docs/json-output.md) を参照してください。

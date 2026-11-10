@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[path = "explain/mod.rs"]
 mod explain_tests;
 
+mod json_support;
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(unix)]
@@ -2359,6 +2361,63 @@ mod unix {
     }
 
     #[test]
+    fn json_recheck_failure_keeps_prior_deletions_and_unattempted_targets() {
+        let repo = Repo::new();
+        for branch in ["a-merged", "b-unreadable", "z-merged"] {
+            repo.git(&["branch", branch]);
+        }
+        let hook = "if [ \"$1\" = for-each-ref ] && [ \"${4:-}\" = refs/heads/b-unreadable ]; then\nexit 91\nfi";
+        let output = individual_shim(&repo, hook)
+            .args(["--format", "json"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let document = json_support::parse(&output.stdout);
+        assert_eq!(document.get("error").get("code").string(), "cleanup_failed");
+        let results = document.get("executions").array();
+        assert!(
+            results
+                .iter()
+                .any(|r| r.get("target").get("name").string() == "a-merged"
+                    && r.get("outcome").string() == "deleted")
+        );
+        assert!(
+            results
+                .iter()
+                .any(|r| r.get("target").get("name").string() == "z-merged"
+                    && r.get("outcome").string() == "not_attempted")
+        );
+        assert!(!repo.exists("a-merged"));
+        assert!(repo.exists("b-unreadable"));
+        assert!(repo.exists("z-merged"));
+    }
+
+    #[test]
+    fn json_bulk_cleanup_failure_does_not_claim_unchanged_refs() {
+        let repo = Repo::new();
+        repo.git(&["branch", "a"]);
+        repo.git(&["branch", "z"]);
+        let hook = "if [ \"$1\" = -c ]; then \"$real_git\" --no-lazy-fetch \"$@\"; printf 'cleanup failed\\n' >&2; exit 23; fi";
+        let output = shim(&repo, hook)
+            .args(["--format", "json"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let document = json_support::parse(&output.stdout);
+        for name in ["a", "z"] {
+            let result = document
+                .get("executions")
+                .array()
+                .iter()
+                .find(|r| r.get("target").get("name").string() == name)
+                .unwrap();
+            assert_eq!(result.get("outcome").string(), "failed");
+            assert!(result.get("detail").string().contains("cleanup failed"));
+            assert!(!repo.exists(name));
+        }
+    }
+
+    #[test]
     fn recheck_failure_stops_remaining_deletions_and_reports_partial_progress() {
         let repo = Repo::new();
         for branch in ["a-merged", "b-unreadable", "z-merged"] {
@@ -2400,4 +2459,135 @@ mod unix {
                 .success()
         );
     }
+}
+
+#[test]
+fn json_br_dry_run_and_delete_preserve_names_and_protection() {
+    let repo = Repo::new();
+    let branch = "日本語-\"quoted\"";
+    repo.git(&["branch", branch]);
+    let preview = checked(repo.cli().args(["br", "--format", "json", "--dry-run"]));
+    let document = json_support::parse(&preview.stdout);
+    assert_eq!(
+        document.get("schema_version"),
+        &json_support::Json::Number(1)
+    );
+    assert_eq!(document.get("dry_run"), &json_support::Json::Bool(true));
+    assert_eq!(document.get("success"), &json_support::Json::Bool(true));
+    assert_eq!(document.get("error"), &json_support::Json::Null);
+    let result = document
+        .get("executions")
+        .array()
+        .iter()
+        .find(|r| r.get("target").get("name").string() == branch)
+        .unwrap();
+    assert_eq!(result.get("outcome").string(), "candidate");
+    assert!(
+        document
+            .get("decisions")
+            .array()
+            .iter()
+            .any(|d| d.get("target").get("name").string() == "main"
+                && d.get("eligibility").string() == "protected")
+    );
+    assert!(repo.exists(branch));
+    let deleted = checked(repo.cli().args(["br", "--format", "json"]));
+    let document = json_support::parse(&deleted.stdout);
+    assert!(
+        document
+            .get("executions")
+            .array()
+            .iter()
+            .any(|r| r.get("target").get("name").string() == branch
+                && r.get("outcome").string() == "deleted")
+    );
+    assert!(!repo.exists(branch));
+    assert!(repo.exists("main"));
+}
+
+#[test]
+fn json_br_empty_and_runtime_error_are_complete_documents() {
+    let repo = Repo::new();
+    repo.git(&["remote", "remove", "origin"]);
+    let output = checked(repo.cli().args(["br", "--format", "json"]));
+    let document = json_support::parse(&output.stdout);
+    assert_eq!(document.get("success"), &json_support::Json::Bool(true));
+    repo.git(&["branch", "topic"]);
+    let output = repo.run(&["br", "--format", "json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let document = json_support::parse(&output.stdout);
+    assert_eq!(document.get("success"), &json_support::Json::Bool(false));
+    assert_eq!(document.get("error").get("code").string(), "cleanup_failed");
+    assert!(repo.exists("topic"));
+}
+
+#[test]
+fn json_invalid_arguments_never_print_help_or_partial_json_to_stdout() {
+    let repo = Repo::new();
+    for args in [
+        vec!["br", "--format"],
+        vec!["br", "--format", "xml"],
+        vec!["br", "--format", "json", "--format", "json"],
+        vec!["br", "--format", "json", "--help"],
+        vec!["wt", "--format", "json", "--help"],
+        vec!["wt", "--format", "json"],
+        vec!["wt", "--days", "--format", "json", "3"],
+        vec!["--format", "json"],
+    ] {
+        let output = repo.cli().env("PATH", "").args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+    }
+    let output = checked(repo.cli().args(["br", "--format", "text", "--dry-run"]));
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn json_br_partial_deletion_failure_keeps_successful_results() {
+    let repo = Repo::new();
+    repo.git(&["branch", "a-locked"]);
+    repo.git(&["branch", "z-merged"]);
+    fs::write(repo.work.join(".git/refs/heads/a-locked.lock"), "").unwrap();
+    let output = repo.run(&["br", "--format", "json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let document = json_support::parse(&output.stdout);
+    assert_eq!(document.get("success"), &json_support::Json::Bool(false));
+    let results = document.get("executions").array();
+    assert!(
+        results
+            .iter()
+            .any(|r| r.get("target").get("name").string() == "a-locked"
+                && r.get("outcome").string() == "failed"
+                && r.get("reason_code").string() == "deletion_failed")
+    );
+    assert!(
+        results
+            .iter()
+            .any(|r| r.get("target").get("name").string() == "z-merged"
+                && r.get("outcome").string() == "deleted")
+    );
+    assert!(repo.exists("a-locked"));
+    assert!(!repo.exists("z-merged"));
+}
+
+#[test]
+fn json_and_explain_together_keep_stdout_machine_readable() {
+    let repo = Repo::new();
+    repo.git(&["branch", "topic"]);
+    for options in [
+        vec!["br", "--format", "json", "--explain", "--dry-run"],
+        vec!["br", "--dry-run", "--explain", "--format", "json"],
+    ] {
+        let output = checked(repo.cli().args(&options));
+        let document = json_support::parse(&output.stdout);
+        assert_eq!(document.get("success"), &json_support::Json::Bool(true));
+        assert!(!text(&output.stdout).contains("explain:"));
+        assert!(repo.exists("topic"));
+    }
+    let output = checked(
+        repo.cli()
+            .args(["br", "--explain", "--format", "text", "--dry-run"]),
+    );
+    assert!(text(&output.stdout).contains("explain:"));
 }

@@ -10,11 +10,12 @@ use crate::{Action, git, git_command_text, git_text, progress::Progress, valid_o
 
 pub const HELP: &str = "giclean wt — Delete inactive merged worktrees
 
-Usage: giclean wt (-d <days> | -h <hours>) [--dry-run] [--explain]
+Usage: giclean wt (-d <days> | -h <hours>) [--dry-run] [--explain] [--format text|json]
 
 Options:
   -d, --days <days>    Wait this many days after merge or later activity
   -h, --hours <hours>  Wait this many hours after merge or later activity
+  --format text|json  Select output format (default: text)
   --dry-run           Show deletion candidates only
   --explain           Explain decisions, including kept worktrees
   --help              Show help (-h means hours for wt)
