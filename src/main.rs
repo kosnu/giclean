@@ -6,6 +6,7 @@ use std::process::{Command, ExitCode, Output, Stdio};
 
 mod bulk;
 pub mod decision;
+mod explain;
 mod git;
 mod progress;
 mod render;
@@ -34,7 +35,7 @@ Run giclean <command> --help for command usage.
 
 const BRANCHES_HELP: &str = "giclean br — Delete merged local branches
 
-Usage: giclean br [--dry-run]
+Usage: giclean br [--dry-run] [--explain]
 
 Delete local branches merged into origin's latest default branch.
 Includes squash changes when all changed paths match in content and permissions
@@ -42,9 +43,10 @@ at one point in the default branch's first-parent history.
 
 Options:
   --dry-run   Show deletion candidates only
+  --explain   Explain decisions, including kept branches
   -h, --help  Show help
 
-Deletes without confirmation. Use --dry-run to preview.
+Deletes without confirmation. Use --dry-run --explain to preview with reasons.
 Does not fetch automatically. GitHub CLI is not required.
 ";
 
@@ -53,10 +55,12 @@ const BRANCH_FORMAT: &str = "--format=%(refname)%09%(objectname)%09%(HEAD)%09%(i
 enum Action {
     Branches {
         dry_run: bool,
+        explain: bool,
     },
     Worktrees {
         age: std::time::Duration,
         dry_run: bool,
+        explain: bool,
     },
     Help,
     BranchesHelp,
@@ -120,6 +124,10 @@ fn main() -> ExitCode {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let mut report = RunReport::default();
+    let show_explanation = matches!(
+        &action,
+        Action::Branches { explain: true, .. } | Action::Worktrees { explain: true, .. }
+    );
     let result = match action {
         Action::Help => write!(out, "{HELP}")
             .map(|()| ExitCode::SUCCESS)
@@ -133,8 +141,18 @@ fn main() -> ExitCode {
         Action::Version => writeln!(out, "giclean {}", env!("CARGO_PKG_VERSION"))
             .map(|()| ExitCode::SUCCESS)
             .map_err(|e| e.to_string()),
-        Action::Branches { dry_run } => clean_branches(dry_run, &mut out, &mut report),
-        Action::Worktrees { age, dry_run } => worktrees::clean(age, dry_run, &mut out, &mut report),
+        Action::Branches { dry_run, .. } => clean_branches(dry_run, &mut out, &mut report),
+        Action::Worktrees { age, dry_run, .. } => {
+            worktrees::clean(age, dry_run, &mut out, &mut report)
+        }
+    };
+    let result = if show_explanation {
+        match explain::write(&report, &mut out) {
+            Ok(()) => result,
+            Err(error) => Err(error.to_string()),
+        }
+    } else {
+        result
     };
     match result.and_then(|status| out.flush().map(|()| status).map_err(|e| e.to_string())) {
         Ok(status) => status,
@@ -151,12 +169,22 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Action, String> {
         [] => Ok(Action::Help),
         [arg] if arg == "--help" || arg == "-h" => Ok(Action::Help),
         [arg] if arg == "--version" || arg == "-V" => Ok(Action::Version),
-        [command] if command == "br" => Ok(Action::Branches { dry_run: false }),
-        [command, option] if command == "br" && option == "--dry-run" => {
-            Ok(Action::Branches { dry_run: true })
-        }
         [command, option] if command == "br" && (option == "--help" || option == "-h") => {
             Ok(Action::BranchesHelp)
+        }
+        [command, options @ ..] if command == "br" => {
+            let mut dry_run = false;
+            let mut explain = false;
+            for option in options {
+                if option == "--dry-run" && !dry_run {
+                    dry_run = true;
+                } else if option == "--explain" && !explain {
+                    explain = true;
+                } else {
+                    return Err("use br [--dry-run] [--explain]".into());
+                }
+            }
+            Ok(Action::Branches { dry_run, explain })
         }
         [command, options @ ..] if command == "wt" => worktrees::parse_args(options),
         _ => Err(format!(

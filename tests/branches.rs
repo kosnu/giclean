@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "explain/mod.rs"]
+mod explain_tests;
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(unix)]

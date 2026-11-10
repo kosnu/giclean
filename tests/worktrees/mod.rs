@@ -785,3 +785,5 @@ fn wt_missing_latest_remote_commit_fails_without_fetch_or_deletion() {
     assert!(!repo.work.join(".git/FETCH_HEAD").exists());
     assert!(!repo.root.join("gh-calls").exists());
 }
+
+mod explain;

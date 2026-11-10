@@ -10,18 +10,20 @@ use crate::{Action, git, git_command_text, git_text, progress::Progress, valid_o
 
 pub const HELP: &str = "giclean wt — Delete inactive merged worktrees
 
-Usage: giclean wt (-d <days> | -h <hours>) [--dry-run]
+Usage: giclean wt (-d <days> | -h <hours>) [--dry-run] [--explain]
 
 Options:
   -d, --days <days>    Wait this many days after merge or later activity
   -h, --hours <hours>  Wait this many hours after merge or later activity
   --dry-run           Show deletion candidates only
+  --explain           Explain decisions, including kept worktrees
   --help              Show help (-h means hours for wt)
 
 Requires a GitHub origin and authenticated GitHub CLI (gh).
 Uses PR merge time, verifies inclusion with Git, and keeps branches.
 Protects main/current/locked worktrees and worktrees with local files or changes.
-Deletes without confirmation. Does not fetch automatically.
+Deletes without confirmation. Use --dry-run --explain to preview with reasons.
+Does not fetch automatically.
 ";
 
 pub fn parse_args(args: &[OsString]) -> Result<Action, String> {
@@ -30,16 +32,21 @@ pub fn parse_args(args: &[OsString]) -> Result<Action, String> {
     }
     let mut age = None;
     let mut dry_run = false;
+    let mut explain = false;
     let mut args = args.iter();
     while let Some(option) = args.next() {
         if option == "--dry-run" && !dry_run {
             dry_run = true;
             continue;
         }
+        if option == "--explain" && !explain {
+            explain = true;
+            continue;
+        }
         let unit = match option.to_str() {
             Some("-d" | "--days") => 86400,
             Some("-h" | "--hours") => 3600,
-            _ => return Err("use wt (-d <days> | -h <hours>) [--dry-run]".into()),
+            _ => return Err("use wt (-d <days> | -h <hours>) [--dry-run] [--explain]".into()),
         };
         if age.is_some() {
             return Err("specify exactly one of --days or --hours".into());
@@ -57,6 +64,7 @@ pub fn parse_args(args: &[OsString]) -> Result<Action, String> {
     Ok(Action::Worktrees {
         age: age.ok_or("specify --days or --hours")?,
         dry_run,
+        explain,
     })
 }
 
