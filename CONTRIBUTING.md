@@ -4,6 +4,7 @@
 
 - Rust / Cargo 1.89.0。`rust-toolchain.toml` で固定しています。
 - Git 2.47 以降。macOS / Linux を対象にしています。
+- 性能チェックには Python 3（標準ライブラリのみ）も使用します。
 - [rustup](https://rustup.rs/) の利用を想定しています。外部クレートの導入は不要です。
 
 `RUSTUP_TOOLCHAIN` や rustup のディレクトリ設定が指定されていると、ツールチェーンファイルより優先されます。使用バージョンは `rustup show active-toolchain` で確認できます。明示する場合は `cargo +1.89.0 test --locked --all-targets` のように指定してください。
@@ -19,6 +20,21 @@ make build  # target/release/giclean を生成
 
 PATH 上で利用する場合は、`make install` で Cargo の bin ディレクトリにインストールします。通常は `~/.cargo/bin` です。内部では `cargo install --path . --locked` を実行します。
 
+### 実時間の性能チェック
+
+CI は Linux / macOS の同じランナー上で変更前後のリリースバイナリを比較します。
+PR は取り込み先のコミット、push は直前のコミットを比較元にします。新規ブランチの初回 push は親コミット、親のない初期コミットだけは比較をスキップして理由を表示します。
+
+通常マージ20本・完全一致10本・未マージ100本・混在・過去に完全一致する10本を、一時リポジトリとローカル bare origin で測定します。各版1回のウォームアップ後、実行順を交互にして各7回の `br` の起動から削除完了までを計測し、**中央値が30%超かつ30ms超悪化したケースがあればCIを失敗**にします。準備・ビルド・ブランチ復元・結果検査は計測外です。削除出力と残存参照、HEAD・作業差分の維持、`FETCH_HEAD` の不在も検査します。
+
+中央値・変化率・全サンプルは CI のログとジョブのサマリーに残ります。ローカルでは同じチェックを実行できます。
+
+```sh
+python3 scripts/check_performance.py --baseline /path/to/before/giclean --candidate target/release/giclean
+```
+
+結果は `performance-results.json` にも出力します。実ネットワーク・SSH 接続・`wt` の所要時間は対象外です。「初回2秒未満・接続再利用時1秒未満」は引き続き実環境での手動計測の目標です。この比較は小さな悪化の累積や、他の履歴・ファイル構成での悪化を網羅しません。
+
 ## 検証
 
 `make check` と `make build` は以下を実行します。
@@ -27,6 +43,7 @@ PATH 上で利用する場合は、`make install` で Cargo の bin ディレク
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
+python3 -m unittest discover -s scripts -p 'test_*.py'
 cargo build --locked --release
 ```
 
