@@ -174,6 +174,36 @@ fn inspect(path: &Path) -> Result<Repository, String> {
     })
 }
 
+// A trailing slash makes lstat follow a directory symlink on Unix. Remove only
+// trailing separators and `/.` for this check, without
+// normalizing `..`, ancestor links,
+// or an all-separator filesystem root.
+fn metadata_path(path: &Path) -> &Path {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        let mut end = bytes.len();
+        loop {
+            end = bytes[..end]
+                .iter()
+                .rposition(|byte| *byte != b'/')
+                .map_or(end, |index| index + 1);
+            if bytes[..end].ends_with(b"/.") {
+                end -= 1;
+            } else {
+                break;
+            }
+        }
+        Path::new(OsStr::from_bytes(&bytes[..end]))
+    }
+    #[cfg(not(unix))]
+    {
+        path
+    }
+}
+
 pub fn discover(options: &DiscoveryOptions) -> Discovery {
     let mut result = Discovery::default();
     let mut repositories: BTreeMap<PathBuf, Repository> = BTreeMap::new();
@@ -184,7 +214,7 @@ pub fn discover(options: &DiscoveryOptions) -> Discovery {
     let mut pending: Vec<_> = options.roots.iter().rev().map(|p| (p.clone(), 0)).collect();
     while let Some((path, depth)) = pending.pop() {
         let visit = (|| -> Result<(), String> {
-            let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+            let metadata = fs::symlink_metadata(metadata_path(&path)).map_err(|e| e.to_string())?;
             if metadata.file_type().is_symlink() {
                 return Err("symbolic links are not followed".into());
             }
@@ -287,4 +317,32 @@ pub fn run(options: &DiscoveryOptions, out: &mut impl Write) -> Result<ExitCode,
     } else {
         ExitCode::FAILURE
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_path_only_removes_trailing_separators() {
+        for (input, expected) in [
+            ("/", "/"),
+            ("//", "//"),
+            ("", ""),
+            ("alias/", "alias"),
+            ("alias///", "alias"),
+            ("a/../alias//", "a/../alias"),
+            ("a//./alias//", "a//./alias"),
+            ("alias/./", "alias"),
+            ("alias/././", "alias"),
+            ("/./", "/"),
+            ("./", "."),
+            ("alias/.././", "alias/.."),
+        ] {
+            assert_eq!(
+                metadata_path(Path::new(input)).as_os_str(),
+                OsString::from(expected)
+            );
+        }
+    }
 }

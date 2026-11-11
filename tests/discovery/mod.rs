@@ -205,3 +205,37 @@ fn non_utf8_path_bytes_are_preserved() {
     let output = checked(repo.cli().arg("repos").arg(&strange));
     assert_eq!(rows(&output), vec![row("repository", &strange)]);
 }
+
+#[cfg(unix)]
+#[test]
+fn explicit_symlink_roots_with_trailing_slashes_are_rejected() {
+    use std::os::unix::fs::symlink;
+    let repo = Repo::new();
+    let alias = repo.root.join("alias");
+    symlink(&repo.work, &alias).unwrap();
+    for suffix in ["/", "///", "/.", "/./", "/././"] {
+        let mut path = alias.clone().into_os_string();
+        path.push(suffix);
+        let output = repo.cli().arg("repos").arg(path).output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(rows(&output).is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("symbolic links are not followed")
+        );
+        let mut regular = repo.work.clone().into_os_string();
+        regular.push(suffix);
+        let output = checked(repo.cli().arg("repos").arg(regular));
+        assert_eq!(rows(&output), vec![row("repository", &repo.work)]);
+    }
+    // Do not collapse parent components through an ancestor symlink: the OS
+    // resolves alias/.. to the real worktree's parent, not the link's parent.
+    let container = repo.root.join("container");
+    fs::create_dir(&container).unwrap();
+    symlink(&repo.work, container.join("ancestor")).unwrap();
+    let output = checked(
+        repo.cli()
+            .arg("repos")
+            .arg(container.join("ancestor/../repo/")),
+    );
+    assert_eq!(rows(&output), vec![row("repository", &repo.work)]);
+}
