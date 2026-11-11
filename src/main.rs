@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::process::{Command, ExitCode, Output, Stdio};
 
+mod batch;
 mod bulk;
 pub mod decision;
 mod discovery;
@@ -25,6 +26,7 @@ const HELP: &str = "giclean — Git cleanup
 Usage: giclean <command> [options]
 
 Commands:
+  batch          Clean multiple repositories
   br             Delete merged local branches
   wt             Delete inactive merged worktrees
   repos          Discover Git repositories
@@ -119,7 +121,11 @@ fn main() -> ExitCode {
     if let Some(status) = bulk::hook() {
         return status;
     }
-    let (action, format) = match parse_options(env::args_os().skip(1)) {
+    let args: Vec<_> = env::args_os().skip(1).collect();
+    if let Some(status) = batch::hook(&args) {
+        return status;
+    }
+    let (action, format) = match parse_options(args.into_iter()) {
         Ok(action) => action,
         Err(error) => {
             eprintln!("giclean: {error}\nUsage: giclean <command> [options]");
