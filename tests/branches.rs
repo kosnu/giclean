@@ -11,6 +11,8 @@ mod json_support;
 
 #[path = "discovery/mod.rs"]
 mod discovery_tests;
+#[path = "batch/mod.rs"]
+mod batch_tests;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 

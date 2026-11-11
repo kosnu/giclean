@@ -889,3 +889,52 @@ fn json_and_explain_worktree_output_stays_json() {
     assert!(!text(&output.stdout).contains("explain:"));
     assert!(tree.exists());
 }
+
+#[test]
+fn batch_wt_preserves_preview_and_dirty_worktree_protection() {
+    let repo = Repo::wt();
+    let (tip, merged, tree) = repo.topic("batch-topic", Some("merge"));
+    repo.pr(&tip, "batch-topic", &merged, old_time());
+    let preview = checked(
+        repo.wt_cli()
+            .args(["batch", "wt", "--days", "3", "--dry-run"])
+            .arg(&repo.work),
+    );
+    assert!(text(&preview.stdout).contains("batch-topic"));
+    assert!(tree.exists());
+    fs::write(tree.join("untracked"), "keep me").unwrap();
+    checked(
+        repo.wt_cli()
+            .args(["batch", "wt", "--days", "3", "--execute"])
+            .arg(&repo.work),
+    );
+    assert!(tree.exists());
+    fs::remove_file(tree.join("untracked")).unwrap();
+    repo.age_tree(&tree);
+    checked(
+        repo.wt_cli()
+            .args(["batch", "wt", "--hours", "72", "--execute"])
+            .arg(&repo.work),
+    );
+    assert!(!tree.exists());
+    assert!(repo.exists("batch-topic"));
+}
+
+#[test]
+fn batch_refuses_cleanup_when_repository_identity_recheck_fails() {
+    let repo = Repo::wt();
+    repo.git(&["branch", "merged"]);
+    repo.git_wrapper(&format!(
+        "case \"$*\" in *--git-common-dir*)\n if [ -f {marker} ]; then exit 1; fi\n touch {marker}\n;; esac",
+        marker = quote(&repo.root.join("inspected-once")),
+    ));
+    let output = repo
+        .wt_cli()
+        .args(["batch", "br", "--execute"])
+        .arg(&repo.work)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(text(&output.stderr).contains("repository identity changed or could not be rechecked"));
+    assert!(repo.exists("merged"));
+}
