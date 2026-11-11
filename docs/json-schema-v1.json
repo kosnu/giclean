@@ -1,0 +1,288 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/kosnu/giclean/blob/main/docs/json-schema-v1.json",
+  "title": "giclean cleanup result version 1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "command",
+    "dry_run",
+    "success",
+    "decisions",
+    "executions",
+    "error"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "command": {
+      "enum": [
+        "br",
+        "wt"
+      ]
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "success": {
+      "type": "boolean"
+    },
+    "decisions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/decision"
+      }
+    },
+    "executions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/execution"
+      }
+    },
+    "error": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "required": [
+            "code",
+            "message"
+          ],
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "target": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "name",
+            "oid"
+          ],
+          "properties": {
+            "kind": {
+              "const": "branch"
+            },
+            "name": {
+              "type": "string"
+            },
+            "oid": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "path",
+            "branch",
+            "oid"
+          ],
+          "properties": {
+            "kind": {
+              "const": "worktree"
+            },
+            "path": {
+              "type": "string"
+            },
+            "branch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "oid": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "decision": {
+      "type": "object",
+      "required": [
+        "target",
+        "eligibility",
+        "reason_code",
+        "inspected_at",
+        "detail",
+        "evidence"
+      ],
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "eligibility": {
+          "enum": [
+            "deletable",
+            "protected",
+            "unknown"
+          ]
+        },
+        "reason_code": {
+          "type": "string"
+        },
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "inspected_at": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "required": [
+                "unix_seconds",
+                "nanoseconds"
+              ],
+              "properties": {
+                "unix_seconds": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "nanoseconds": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 999999999
+                }
+              }
+            }
+          ]
+        },
+        "evidence": {
+          "type": "object",
+          "required": [
+            "merged_at",
+            "latest_activity",
+            "cutoff"
+          ],
+          "properties": {
+            "merged_at": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "unix_seconds",
+                    "nanoseconds"
+                  ],
+                  "properties": {
+                    "unix_seconds": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "nanoseconds": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 999999999
+                    }
+                  }
+                }
+              ]
+            },
+            "latest_activity": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "unix_seconds",
+                    "nanoseconds"
+                  ],
+                  "properties": {
+                    "unix_seconds": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "nanoseconds": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 999999999
+                    }
+                  }
+                }
+              ]
+            },
+            "cutoff": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "unix_seconds",
+                    "nanoseconds"
+                  ],
+                  "properties": {
+                    "unix_seconds": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "nanoseconds": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 999999999
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "required": [
+        "target",
+        "outcome",
+        "reason_code",
+        "detail"
+      ],
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "outcome": {
+          "type": "string"
+        },
+        "reason_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

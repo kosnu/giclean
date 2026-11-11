@@ -8,6 +8,7 @@ mod bulk;
 pub mod decision;
 mod explain;
 mod git;
+mod json;
 mod progress;
 mod render;
 mod ssh;
@@ -35,13 +36,14 @@ Run giclean <command> --help for command usage.
 
 const BRANCHES_HELP: &str = "giclean br — Delete merged local branches
 
-Usage: giclean br [--dry-run] [--explain]
+Usage: giclean br [--dry-run] [--explain] [--format text|json]
 
 Delete local branches merged into origin's latest default branch.
 Includes squash changes when all changed paths match in content and permissions
 at one point in the default branch's first-parent history.
 
 Options:
+  --format text|json  Select output format (default: text)
   --dry-run   Show deletion candidates only
   --explain   Explain decisions, including kept branches
   -h, --help  Show help
@@ -113,7 +115,7 @@ fn main() -> ExitCode {
     if let Some(status) = bulk::hook() {
         return status;
     }
-    let action = match parse_args(env::args_os().skip(1)) {
+    let (action, format) = match parse_options(env::args_os().skip(1)) {
         Ok(action) => action,
         Err(error) => {
             eprintln!("giclean: {error}\nUsage: giclean <command> [options]");
@@ -141,12 +143,24 @@ fn main() -> ExitCode {
         Action::Version => writeln!(out, "giclean {}", env!("CARGO_PKG_VERSION"))
             .map(|()| ExitCode::SUCCESS)
             .map_err(|e| e.to_string()),
-        Action::Branches { dry_run, .. } => clean_branches(dry_run, &mut out, &mut report),
+        Action::Branches { dry_run, .. } => {
+            if format == OutputFormat::Json {
+                let result = clean_branches(dry_run, &mut io::sink(), &mut report);
+                json_result(&mut out, "br", dry_run, &report, result)
+            } else {
+                clean_branches(dry_run, &mut out, &mut report)
+            }
+        }
         Action::Worktrees { age, dry_run, .. } => {
-            worktrees::clean(age, dry_run, &mut out, &mut report)
+            if format == OutputFormat::Json {
+                let result = worktrees::clean(age, dry_run, &mut io::sink(), &mut report);
+                json_result(&mut out, "wt", dry_run, &report, result)
+            } else {
+                worktrees::clean(age, dry_run, &mut out, &mut report)
+            }
         }
     };
-    let result = if show_explanation {
+    let result = if show_explanation && format == OutputFormat::Text {
         match explain::write(&report, &mut out) {
             Ok(()) => result,
             Err(error) => Err(error.to_string()),
@@ -161,6 +175,73 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputFormat {
+    Text,
+    Json,
+}
+
+fn parse_options(args: impl Iterator<Item = OsString>) -> Result<(Action, OutputFormat), String> {
+    let args: Vec<_> = args.collect();
+    if !args.first().is_some_and(|arg| arg == "br" || arg == "wt") {
+        return parse_args(args.into_iter()).map(|action| (action, OutputFormat::Text));
+    }
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut format = None;
+    let mut args = args.into_iter();
+    filtered.push(args.next().unwrap());
+    let worktrees = filtered[0] == "wt";
+    while let Some(arg) = args.next() {
+        if arg == "--format" {
+            if format.is_some() {
+                return Err("specify --format only once".into());
+            }
+            format = Some(match args.next().as_deref().and_then(|arg| arg.to_str()) {
+                Some("text") => OutputFormat::Text,
+                Some("json") => OutputFormat::Json,
+                _ => return Err("--format requires text or json".into()),
+            });
+        } else {
+            let takes_value =
+                worktrees && matches!(arg.to_str(), Some("-d" | "--days" | "-h" | "--hours"));
+            filtered.push(arg);
+            if takes_value && let Some(value) = args.next() {
+                filtered.push(value);
+            }
+        }
+    }
+    let action = parse_args(filtered.into_iter())?;
+    let format = format.unwrap_or(OutputFormat::Text);
+    if format == OutputFormat::Json
+        && !matches!(action, Action::Branches { .. } | Action::Worktrees { .. })
+    {
+        return Err("--format json cannot be combined with help".into());
+    }
+    Ok((action, format))
+}
+
+fn json_result(
+    out: &mut impl Write,
+    command: &str,
+    dry_run: bool,
+    report: &RunReport,
+    result: Result<ExitCode, String>,
+) -> Result<ExitCode, String> {
+    json::render(
+        out,
+        command,
+        dry_run,
+        &report.decisions,
+        &report.results,
+        result
+            .as_ref()
+            .is_ok_and(|status| *status == ExitCode::SUCCESS),
+        report.error.as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
+    result
 }
 
 fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Action, String> {
