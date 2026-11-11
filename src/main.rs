@@ -6,6 +6,7 @@ use std::process::{Command, ExitCode, Output, Stdio};
 
 mod bulk;
 pub mod decision;
+mod discovery;
 mod explain;
 mod git;
 mod json;
@@ -26,6 +27,7 @@ Usage: giclean <command> [options]
 Commands:
   br             Delete merged local branches
   wt             Delete inactive merged worktrees
+  repos          Discover Git repositories
 
 Options:
   -h, --help     Show help
@@ -55,6 +57,8 @@ Does not fetch automatically. GitHub CLI is not required.
 const BRANCH_FORMAT: &str = "--format=%(refname)%09%(objectname)%09%(HEAD)%09%(if)%(worktreepath)%(then)used%(else)free%(end)%09%(symref)";
 
 enum Action {
+    Repositories(discovery::DiscoveryOptions),
+    RepositoriesHelp,
     Branches {
         dry_run: bool,
         explain: bool,
@@ -131,6 +135,10 @@ fn main() -> ExitCode {
         Action::Branches { explain: true, .. } | Action::Worktrees { explain: true, .. }
     );
     let result = match action {
+        Action::Repositories(options) => discovery::run(&options, &mut out),
+        Action::RepositoriesHelp => write!(out, "{}", discovery::HELP)
+            .map(|()| ExitCode::SUCCESS)
+            .map_err(|e| e.to_string()),
         Action::Help => write!(out, "{HELP}")
             .map(|()| ExitCode::SUCCESS)
             .map_err(|e| e.to_string()),
@@ -266,6 +274,12 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Action, String> {
                 }
             }
             Ok(Action::Branches { dry_run, explain })
+        }
+        [command, option] if command == "repos" && (option == "--help" || option == "-h") => {
+            Ok(Action::RepositoriesHelp)
+        }
+        [command, options @ ..] if command == "repos" => {
+            discovery::parse(options).map(Action::Repositories)
         }
         [command, options @ ..] if command == "wt" => worktrees::parse_args(options),
         _ => Err(format!(
