@@ -5,13 +5,16 @@ use std::io::{self, Write};
 use std::process::{Command, ExitCode, Output, Stdio};
 
 mod bulk;
+pub mod decision;
 mod git;
 mod progress;
+mod render;
 mod ssh;
 #[cfg(unix)]
 mod terminal;
 mod worktrees;
 
+use decision::{Decision, Outcome, ReasonCode, RunReport, Target, record_outcome};
 use progress::Progress;
 
 const HELP: &str = "giclean — Git cleanup
@@ -70,10 +73,30 @@ struct Branch {
 }
 
 impl Branch {
+    fn protection(&self) -> Option<ReasonCode> {
+        if self.in_use {
+            Some(ReasonCode::BranchInUse)
+        } else if self.symbolic {
+            Some(ReasonCode::SymbolicBranch)
+        } else if matches!(self.name.as_str(), "main" | "master" | "production") {
+            Some(ReasonCode::ProtectedBranch)
+        } else {
+            None
+        }
+    }
+
     fn protected(&self) -> bool {
-        self.in_use
-            || self.symbolic
-            || matches!(self.name.as_str(), "main" | "master" | "production")
+        self.protection().is_some()
+    }
+
+    fn decision(&self, reason: ReasonCode) -> Decision {
+        Decision::new(
+            Target::Branch {
+                name: self.name.clone(),
+                oid: self.oid.clone(),
+            },
+            reason,
+        )
     }
 }
 
@@ -96,6 +119,7 @@ fn main() -> ExitCode {
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
+    let mut report = RunReport::default();
     let result = match action {
         Action::Help => write!(out, "{HELP}")
             .map(|()| ExitCode::SUCCESS)
@@ -109,8 +133,8 @@ fn main() -> ExitCode {
         Action::Version => writeln!(out, "giclean {}", env!("CARGO_PKG_VERSION"))
             .map(|()| ExitCode::SUCCESS)
             .map_err(|e| e.to_string()),
-        Action::Branches { dry_run } => clean_branches(dry_run, &mut out),
-        Action::Worktrees { age, dry_run } => worktrees::clean(age, dry_run, &mut out),
+        Action::Branches { dry_run } => clean_branches(dry_run, &mut out, &mut report),
+        Action::Worktrees { age, dry_run } => worktrees::clean(age, dry_run, &mut out, &mut report),
     };
     match result.and_then(|status| out.flush().map(|()| status).map_err(|e| e.to_string())) {
         Ok(status) => status,
@@ -590,37 +614,92 @@ fn latest_remote_head(progress: &Progress) -> Result<RemoteHead, String> {
     Ok(remote)
 }
 
-fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<ExitCode, String> {
-    let progress = Progress::start("Checking local branches...");
-    if git_text(&["rev-parse", "--is-inside-work-tree"], &progress)?.trim() != "true" {
-        return Err("run this command inside a Git working tree".into());
+struct BranchInspection {
+    candidates: BTreeMap<String, Branch>,
+}
+
+fn inspect_branches(
+    progress: &Progress,
+    report: &mut RunReport,
+) -> Result<BranchInspection, String> {
+    let all = branch_snapshot(None, None, progress)?;
+    for branch in all.values() {
+        report.record(branch.decision(branch.protection().unwrap_or(ReasonCode::NotInspected)));
     }
-    let initial: BTreeMap<_, _> = branch_snapshot(None, None, &progress)?
+    let initial: BTreeMap<_, _> = all
         .into_iter()
         .filter(|(_, branch)| !branch.protected())
         .collect();
     if initial.is_empty() {
-        progress.finish();
-        return Ok(ExitCode::SUCCESS);
+        return Ok(BranchInspection {
+            candidates: BTreeMap::new(),
+        });
     }
-
-    let remote = latest_remote_head(&progress)?;
+    let remote = latest_remote_head(progress)?;
     progress.update("Checking merged branches...");
-    let mut merged = branch_snapshot(Some(&remote.oid), None, &progress)?;
+    let mut merged = branch_snapshot(Some(&remote.oid), None, progress)?;
     let tips: BTreeSet<_> = initial
         .iter()
         .filter(|(name, _)| *name != &remote.branch && !merged.contains_key(*name))
         .map(|(_, branch)| branch.oid.as_str())
         .collect();
-    let included = squash_included(
-        &tips.into_iter().collect::<Vec<_>>(),
-        &remote.oid,
-        &progress,
-    )?;
+    let included = squash_included(&tips.into_iter().collect::<Vec<_>>(), &remote.oid, progress)?;
+    let ancestry: BTreeSet<_> = merged.keys().cloned().collect();
     for (name, branch) in &initial {
         if name != &remote.branch && !merged.contains_key(name) && included.contains(&branch.oid) {
             merged.insert(name.clone(), branch.clone());
         }
+    }
+    let mut candidates = BTreeMap::new();
+    for (name, branch) in &initial {
+        let reason = if name == &remote.branch {
+            ReasonCode::DefaultBranch
+        } else if let Some(current) = merged.get(name) {
+            if let Some(reason) = current.protection() {
+                reason
+            } else if current.oid != branch.oid {
+                ReasonCode::StateChanged
+            } else if ancestry.contains(name) {
+                ReasonCode::Merged
+            } else {
+                ReasonCode::SquashIncluded
+            }
+        } else {
+            ReasonCode::NotMerged
+        };
+        let decision = branch.decision(reason);
+        if decision.is_deletable() {
+            candidates.insert(name.clone(), merged[name].clone());
+        }
+        report.record(decision);
+    }
+    Ok(BranchInspection { candidates })
+}
+
+fn clean_branches(
+    dry_run: bool,
+    out: &mut impl Write,
+    report: &mut RunReport,
+) -> Result<ExitCode, String> {
+    let result = execute_branches(dry_run, out, report);
+    report.finish(&result);
+    result
+}
+
+fn execute_branches(
+    dry_run: bool,
+    out: &mut impl Write,
+    report: &mut RunReport,
+) -> Result<ExitCode, String> {
+    let progress = Progress::start("Checking local branches...");
+    if git_text(&["rev-parse", "--is-inside-work-tree"], &progress)?.trim() != "true" {
+        return Err("run this command inside a Git working tree".into());
+    }
+    let inspection = inspect_branches(&progress, report)?;
+    let candidates = inspection.candidates;
+    if candidates.is_empty() {
+        progress.finish();
+        return Ok(ExitCode::SUCCESS);
     }
     progress.update(if dry_run {
         "Checking deletion candidates..."
@@ -629,23 +708,21 @@ fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<ExitCode, Strin
     });
     let mut results = Vec::new();
     let mut failed = false;
-    let candidates: BTreeMap<_, _> = merged
-        .iter()
-        .filter(|(name, branch)| {
-            !branch.protected()
-                && *name != &remote.branch
-                && initial.get(*name).is_some_and(|old| old.oid == branch.oid)
-        })
-        .map(|(name, branch)| (name.clone(), branch.clone()))
-        .collect();
     let batch_failure = if dry_run {
         None
     } else {
         match bulk::delete(&candidates, &progress)? {
             bulk::Outcome::Deleted => {
                 progress.finish();
+                for branch in candidates.values() {
+                    record_outcome(
+                        &mut report.results,
+                        &branch.decision(ReasonCode::Merged).target,
+                        Outcome::Deleted,
+                    );
+                }
                 for name in candidates.keys() {
-                    writeln!(out, "{name}: deleted").map_err(|e| e.to_string())?;
+                    writeln!(out, "{}", render::deleted(name)).map_err(|e| e.to_string())?;
                 }
                 return Ok(ExitCode::SUCCESS);
             }
@@ -653,18 +730,18 @@ fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<ExitCode, Strin
             bulk::Outcome::Individual => None,
         }
     };
-    for (name, branch) in merged {
-        if branch.protected()
-            || name == remote.branch
-            || initial.get(&name).is_none_or(|old| old.oid != branch.oid)
-        {
-            continue;
-        }
+    for (name, branch) in candidates {
+        let decision = report
+            .decisions
+            .iter_mut()
+            .find(|d| matches!(&d.target, Target::Branch { name: n, .. } if n == &name))
+            .expect("candidate has a decision");
         // Recheck each branch immediately before acting, including changes made after
         // the remote query. Git also refuses to delete branches checked out in worktrees.
         let latest = match branch_snapshot(None, Some(&name), &progress) {
             Ok(latest) => latest,
             Err(error) => {
+                decision.inspection_failed(error.clone());
                 if !dry_run {
                     progress.suspend();
                     for result in &results {
@@ -677,24 +754,36 @@ fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<ExitCode, Strin
         // A failed batch may have removed refs before branch-config cleanup
         // failed. Preserve those failure rows instead of silently losing them.
         if !latest.contains_key(&name) {
+            decision.revise(ReasonCode::TargetMissing);
+            record_outcome(&mut report.results, &decision.target, Outcome::Skipped);
             if let Some(output) = &batch_failure {
                 failed = true;
-                results.push(format!(
-                    "{name}: failed ({})",
-                    deletion_reason(&name, output)
-                ));
+                let detail = deletion_reason(&name, output);
+                record_outcome(
+                    &mut report.results,
+                    &decision.target,
+                    Outcome::Failed(detail.clone()),
+                );
+                results.push(render::failed(&name, detail));
             }
             continue;
         }
-        if latest
-            .get(&name)
-            .is_none_or(|current| current.protected() || current.oid != branch.oid)
-        {
+        let current = &latest[&name];
+        if let Some(reason) = current.protection() {
+            decision.revise(reason);
+            record_outcome(&mut report.results, &decision.target, Outcome::Skipped);
             continue;
         }
+        if current.oid != branch.oid {
+            decision.revise(ReasonCode::StateChanged);
+            record_outcome(&mut report.results, &decision.target, Outcome::Skipped);
+            continue;
+        }
+        decision.revise(decision.reason);
         if dry_run {
             progress.suspend();
-            writeln!(out, "candidate: {name}").map_err(|e| e.to_string())?;
+            record_outcome(&mut report.results, &decision.target, Outcome::Candidate);
+            writeln!(out, "{}", render::candidate(&name)).map_err(|e| e.to_string())?;
         } else {
             // Capture diagnostics for the result row instead of interrupting the spinner.
             // Git's English diagnostics also keep failure reasons independent of locale.
@@ -703,18 +792,28 @@ fn clean_branches(dry_run: bool, out: &mut impl Write) -> Result<ExitCode, Strin
                 .output();
             match deletion {
                 Ok(output) if output.status.success() => {
-                    results.push(format!("{name}: deleted"));
+                    record_outcome(&mut report.results, &decision.target, Outcome::Deleted);
+                    results.push(render::deleted(&name));
                 }
                 Ok(output) => {
                     failed = true;
-                    results.push(format!(
-                        "{name}: failed ({})",
-                        deletion_reason(&name, &output)
-                    ));
+                    let detail = deletion_reason(&name, &output);
+                    record_outcome(
+                        &mut report.results,
+                        &decision.target,
+                        Outcome::Failed(detail.clone()),
+                    );
+                    results.push(render::failed(&name, detail));
                 }
                 Err(error) => {
                     failed = true;
-                    results.push(format!("{name}: failed (could not run git: {error})"));
+                    let detail = format!("could not run git: {error}");
+                    record_outcome(
+                        &mut report.results,
+                        &decision.target,
+                        Outcome::Failed(detail.clone()),
+                    );
+                    results.push(render::failed(&name, detail));
                 }
             }
         }
@@ -755,6 +854,29 @@ fn deletion_reason(name: &str, output: &Output) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn branch_protection_has_structured_reasons() {
+        let mut branch = Branch {
+            name: "topic".into(),
+            oid: "a".repeat(40),
+            in_use: false,
+            symbolic: false,
+        };
+        assert_eq!(branch.protection(), None);
+        branch.symbolic = true;
+        assert_eq!(branch.protection(), Some(ReasonCode::SymbolicBranch));
+        branch.in_use = true;
+        assert_eq!(branch.protection(), Some(ReasonCode::BranchInUse));
+        branch.in_use = false;
+        branch.symbolic = false;
+        for name in ["main", "master", "production"] {
+            branch.name = name.into();
+            let d = branch.decision(branch.protection().unwrap());
+            assert_eq!(d.reason, ReasonCode::ProtectedBranch);
+            assert!(!d.is_deletable());
+        }
+    }
 
     #[test]
     fn remote_head_requires_both_a_symbolic_branch_and_a_valid_oid() {
