@@ -151,3 +151,24 @@ fn option_terminator_preserves_flag_shaped_root_paths() {
     assert!(text(&output.stderr).contains("--help"));
     assert!(!text(&output.stdout).contains("Usage:"));
 }
+
+#[test]
+fn bare_root_stays_skipped_when_launched_from_its_linked_worktree() {
+    let repo = Repo::new();
+    let linked = repo.root.join("bare-linked");
+    checked(
+        repo.git_command()
+            .arg("--git-dir")
+            .arg(&repo.origin)
+            .args(["worktree", "add"])
+            .arg(&linked)
+            .arg("main"),
+    );
+    let output = checked(
+        repo.cli()
+            .current_dir(&linked)
+            .args(["batch", "br", "--execute"])
+            .arg(&repo.origin),
+    );
+    assert!(text(&output.stdout).contains("0 succeeded, 0 failed, 1 skipped"));
+}

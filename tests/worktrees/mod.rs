@@ -930,6 +930,7 @@ fn batch_refuses_cleanup_when_repository_identity_recheck_fails() {
     ));
     let output = repo
         .wt_cli()
+        .current_dir(&repo.root)
         .args(["batch", "br", "--execute"])
         .arg(&repo.work)
         .output()
@@ -937,4 +938,22 @@ fn batch_refuses_cleanup_when_repository_identity_recheck_fails() {
     assert!(!output.status.success());
     assert!(text(&output.stderr).contains("repository identity changed or could not be rechecked"));
     assert!(repo.exists("merged"));
+}
+
+#[test]
+fn batch_keeps_launch_worktree_even_when_discovery_prefers_main() {
+    let repo = Repo::wt();
+    let (tip, merged, tree) = repo.topic("batch-current", Some("merge"));
+    repo.pr(&tip, "batch-current", &merged, old_time());
+    fs::create_dir(tree.join("subdirectory")).unwrap();
+    repo.age_tree(&tree);
+    let output = checked(
+        repo.wt_cli()
+            .current_dir(tree.join("subdirectory"))
+            .args(["batch", "wt", "--days", "3", "--execute", "--explain"])
+            .arg(&repo.work)
+            .arg(&tree),
+    );
+    assert!(tree.exists());
+    assert!(text(&output.stdout).contains("current worktree"));
 }

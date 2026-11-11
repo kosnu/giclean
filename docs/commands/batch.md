@@ -13,6 +13,7 @@ giclean batch wt --hours 72 --execute ~/dev
 - `--exclude NAME` は正確に一致するディレクトリ名を除外し、複数回指定できます。globは展開しません。
 - `--` 以降はすべて探索パスとして扱います。
 - シンボリックリンクは追跡しません。linked worktree は common Git directory で重複排除し、探索範囲内の主 worktree を優先します。
+- 起動元が同じリポジトリのworktree内なら、そのworktreeを実行場所として優先し、元のcurrent worktree保護を維持します。
 - bare repository はスキップします。
 - 子プロセス起動直前にもリポジトリの同一性を再確認します。既存の保護条件、マージ判定、削除直前の再検査を省略しません。自動fetchは行いません。
 - `wt` では従来どおりGitHubのoriginと認証済み`gh`が必要です。

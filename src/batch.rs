@@ -33,7 +33,7 @@ struct Options {
 }
 
 pub fn hook(args: &[OsString]) -> Option<ExitCode> {
-    if !args.first().is_some_and(|arg| arg == "batch") {
+    if args.first().is_none_or(|arg| arg != "batch") {
         return None;
     }
     if args.len() == 1
@@ -141,6 +141,29 @@ fn parse(args: &[OsString]) -> Result<Options, String> {
     })
 }
 
+// Keep the launch worktree protected even when discovery prefers its main tree.
+fn launch_worktree() -> Result<Option<discovery::Repository>, String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    for ancestor in cwd.ancestors() {
+        match std::fs::symlink_metadata(ancestor.join(".git")) {
+            Ok(_) => {
+                let mut result = discovery::discover(&DiscoveryOptions {
+                    roots: vec![ancestor.to_owned()],
+                    max_depth: 0,
+                    excludes: Vec::new(),
+                });
+                if !result.errors.is_empty() || result.repositories.len() != 1 {
+                    return Err("cannot identify the current worktree safely".into());
+                }
+                return Ok(result.repositories.pop());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot inspect current worktree: {error}")),
+        }
+    }
+    Ok(None)
+}
+
 fn run(options: Options) -> Result<ExitCode, String> {
     // Reject ambient repository overrides instead of risking another repository.
     // Preserve authentication, global configuration, and transport settings.
@@ -161,6 +184,7 @@ fn run(options: Options) -> Result<ExitCode, String> {
             return Err(format!("unset {name} before running batch cleanup"));
         }
     }
+    let launch = launch_worktree()?;
     let discovered = discovery::discover(&options.discovery);
     let discovery_errors = discovered.errors.len();
     let mut failed = discovery_errors > 0;
@@ -173,7 +197,15 @@ fn run(options: Options) -> Result<ExitCode, String> {
     for error in discovered.errors {
         eprintln!("giclean batch: {:?}: {}", error.path, error.message);
     }
-    for repository in discovered.repositories {
+    for mut repository in discovered.repositories {
+        if let Some(launch) = &launch
+            && launch.common_git_dir == repository.common_git_dir
+            && !launch.bare
+            && !repository.bare
+        {
+            repository.path = launch.path.clone();
+            repository.bare = false;
+        }
         writeln!(out, "== Repository {:?} ==", repository.path).map_err(|e| e.to_string())?;
         if repository.bare {
             writeln!(out, "Skipped: bare repository").map_err(|e| e.to_string())?;
