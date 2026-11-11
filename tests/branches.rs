@@ -9,6 +9,9 @@ mod explain_tests;
 
 mod json_support;
 
+#[path = "discovery/mod.rs"]
+mod discovery_tests;
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(unix)]

@@ -97,3 +97,10 @@ GitHub Actions は push / pull request で同じ検証とリリースビルド�
 `0.2.0-rc.1` のようなバージョンと `v0.2.0-rc.1` タグは GitHub の prerelease として公開します。一度公開したタグは移動・再利用せず、修正は新しいバージョンでリリースします。crates.io への公開は行いません。
 
 利用開始に必要な情報は [README](README.md)、コマンドの仕様と制約は [br の仕様](docs/commands/br.md)・[wt の仕様](docs/commands/wt.md)、設計判断や SSH 接続の説明は [設計](docs/design.md)に記載します。
+
+### リポジトリ探索の検証
+
+`repos` の結合テストでは通常・bare・linked worktree・入れ子の実リポジトリを使い、
+深度制限、basename除外、重複/重なったルート、symlink循環、Gitメタデータの非探索、
+壊れたGit参照や存在しないパスのエラー分離、Gitディレクトリ環境変数の隔離を確認します。
+改行・日本語のパスと、Linuxでは非UTF-8のパスも検証します（macOSのファイルシステムは非UTF-8名を許可しません）。
