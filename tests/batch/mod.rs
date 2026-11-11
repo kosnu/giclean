@@ -172,3 +172,27 @@ fn bare_root_stays_skipped_when_launched_from_its_linked_worktree() {
     );
     assert!(text(&output.stdout).contains("0 succeeded, 0 failed, 1 skipped"));
 }
+
+#[cfg(unix)]
+#[test]
+fn execution_rejects_symlink_roots_with_trailing_directory_syntax() {
+    use std::os::unix::fs::symlink;
+
+    let repo = Repo::new();
+    repo.git(&["branch", "merged"]);
+    let link = repo.root.join("linked-root");
+    symlink(&repo.work, &link).unwrap();
+    for suffix in ["/", "//", "/.", "/./"] {
+        let mut root = link.as_os_str().to_os_string();
+        root.push(suffix);
+        let output = repo
+            .cli()
+            .args(["batch", "br", "--execute"])
+            .arg(root)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "suffix: {suffix}");
+        assert!(repo.exists("merged"), "suffix: {suffix}");
+        assert!(text(&output.stderr).contains("symbolic links are not followed"));
+    }
+}
