@@ -1,2 +1,4 @@
 /target/
+/scripts/__pycache__/
+/performance-results.json
 .DS_Store
