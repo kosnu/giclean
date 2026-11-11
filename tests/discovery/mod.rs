@@ -239,3 +239,48 @@ fn explicit_symlink_roots_with_trailing_slashes_are_rejected() {
     );
     assert_eq!(rows(&output), vec![row("repository", &repo.work)]);
 }
+
+#[test]
+fn separate_git_directory_is_skipped_and_main_worktree_wins() {
+    let repo = Repo::new();
+    let root = repo.root.join("separate");
+    fs::create_dir(&root).unwrap();
+    let main = root.join("main");
+    let metadata = root.join("metadata");
+    checked(
+        repo.git_command()
+            .args(["init", "--initial-branch=main", "--separate-git-dir"])
+            .arg(&metadata)
+            .arg(&main),
+    );
+    checked(repo.git_command().current_dir(&main).args([
+        "-c",
+        "commit.gpgSign=false",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "initial",
+    ]));
+    let linked = root.join("aaa-linked");
+    checked(
+        repo.git_command()
+            .current_dir(&main)
+            .args(["worktree", "add", "-b", "linked"])
+            .arg(&linked),
+    );
+    // If metadata is traversed this nested repository would leak into results.
+    init(&repo, &metadata.join("must-not-descend"));
+    assert!(rows(&checked(repo.cli().arg("repos").arg(&metadata))).is_empty());
+    assert_eq!(
+        rows(&checked(repo.cli().arg("repos").arg(&root))),
+        vec![row("repository", &main)]
+    );
+    assert_eq!(
+        rows(&checked(repo.cli().arg("repos").arg(&linked).arg(&main))),
+        vec![row("repository", &main)]
+    );
+    assert_eq!(
+        rows(&checked(repo.cli().arg("repos").arg(&linked))),
+        vec![row("repository", &linked)]
+    );
+}

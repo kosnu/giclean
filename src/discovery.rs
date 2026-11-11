@@ -42,6 +42,7 @@ pub struct Repository {
     pub path: PathBuf,
     pub common_git_dir: PathBuf,
     pub bare: bool,
+    main_worktree: bool,
 }
 
 #[derive(Debug)]
@@ -150,7 +151,7 @@ fn path_from_bytes(bytes: Vec<u8>) -> Result<PathBuf, String> {
     }
 }
 
-fn inspect(path: &Path) -> Result<Repository, String> {
+fn inspect(path: &Path) -> Result<Option<Repository>, String> {
     let common_git_dir = path_from_bytes(git_path(path, "--git-common-dir")?)?
         .canonicalize()
         .map_err(|e| format!("cannot resolve common Git directory: {e}"))?;
@@ -159,6 +160,14 @@ fn inspect(path: &Path) -> Result<Repository, String> {
         b"false" => false,
         _ => return Err("invalid bare repository response".into()),
     };
+    let git_dir = path_from_bytes(git_path(path, "--absolute-git-dir")?)?
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve Git directory: {e}"))?;
+    if !bare && git_dir == path {
+        // A valid --separate-git-dir directory is metadata, not a cleanup
+        // target. Do not recurse into it or require a worktree top-level.
+        return Ok(None);
+    }
     if !bare {
         let top = path_from_bytes(git_path(path, "--show-toplevel")?)?
             .canonicalize()
@@ -167,11 +176,12 @@ fn inspect(path: &Path) -> Result<Repository, String> {
             return Err("Git repository root does not match discovered path".into());
         }
     }
-    Ok(Repository {
+    Ok(Some(Repository {
+        main_worktree: !bare && git_dir == common_git_dir,
         path: path.to_owned(),
         common_git_dir,
         bare,
-    })
+    }))
 }
 
 // A trailing slash makes lstat follow a directory symlink on Unix. Remove only
@@ -240,15 +250,11 @@ pub fn discover(options: &DiscoveryOptions) -> Discovery {
                 && path.join("refs").is_dir();
             if git_marker || bare_marker {
                 match inspect(&path) {
-                    Ok(repo) => {
+                    Ok(None) => return Ok(()),
+                    Ok(Some(repo)) => {
                         let is_bare = repo.bare;
-                        let rank = |repo: &Repository| {
-                            (
-                                repo.bare,
-                                !repo.path.join(".git").is_dir(),
-                                repo.path.clone(),
-                            )
-                        };
+                        let rank =
+                            |repo: &Repository| (repo.bare, !repo.main_worktree, repo.path.clone());
                         if repositories
                             .get(&repo.common_git_dir)
                             .is_none_or(|old| rank(&repo) < rank(old))
