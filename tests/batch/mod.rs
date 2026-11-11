@@ -196,3 +196,35 @@ fn execution_rejects_symlink_roots_with_trailing_directory_syntax() {
         assert!(text(&output.stderr).contains("symbolic links are not followed"));
     }
 }
+
+#[test]
+fn separate_git_metadata_is_skipped_and_main_worktree_is_preferred() {
+    let repo = Repo::new();
+    checked(
+        repo.git_command()
+            .args(["init", "--separate-git-dir"])
+            .arg(repo.root.join("metadata")),
+    );
+    repo.git(&["branch", "linked"]);
+    repo.add_worktree("linked", "a-linked");
+    repo.git(&["branch", "merged"]);
+    for mode in ["--dry-run", "--execute"] {
+        let output = checked(
+            repo.cli()
+                .current_dir(&repo.root)
+                .args(["batch", "br", mode])
+                .arg(&repo.root),
+        );
+        let stdout = text(&output.stdout);
+        assert!(stdout.contains(&format!(
+            "== Repository {:?} ==",
+            fs::canonicalize(&repo.work).unwrap()
+        )));
+        assert!(!stdout.contains("a-linked"));
+        assert!(!stdout.contains("metadata"));
+        assert!(stdout.contains("1 succeeded, 0 failed, 1 skipped, 0 discovery errors"));
+        assert_eq!(repo.exists("merged"), mode == "--dry-run");
+        assert!(repo.exists("linked"));
+        assert!(repo.exists("main"));
+    }
+}
