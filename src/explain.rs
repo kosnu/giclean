@@ -36,6 +36,8 @@ fn reason_text(reason: ReasonCode) -> &'static str {
         ReasonCode::NoVerifiedMerge => "no matching PR merge time with verified Git inclusion",
         ReasonCode::NotInspected => "inspection was not completed; deletion was not authorized",
         ReasonCode::InspectionFailed => "inspection failed; deletion was not authorized",
+        ReasonCode::AgentActive => "agent has a live worktree reference",
+        ReasonCode::AgentUnknown => "agent usage could not be ruled out safely",
     }
 }
 

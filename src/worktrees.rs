@@ -385,6 +385,37 @@ struct WorktreeInspection {
     cutoff: Option<SystemTime>,
 }
 
+fn protect_with_agents(tree: &Worktree, decision: &mut Decision) -> bool {
+    use giclean::agents::{AgentState, Protection, codex::CodexDetector};
+
+    let inspection = giclean::agents::inspect(&tree.path, &[&CodexDetector]);
+    let reason = match inspection.protection() {
+        Protection::Clear => return false,
+        Protection::Active => ReasonCode::AgentActive,
+        Protection::Unknown => ReasonCode::AgentUnknown,
+    };
+    decision.revise(reason);
+    // Only fixed provider/state/failure codes; never paths or raw OS errors.
+    decision.detail = Some(
+        inspection
+            .observations()
+            .iter()
+            .map(|observation| {
+                let state = match observation.result {
+                    Ok(AgentState::Active) => "active",
+                    Ok(AgentState::Historical) => "historical",
+                    Ok(AgentState::Unknown) => "unknown",
+                    Ok(AgentState::NoReference) => "no_reference",
+                    Err(failure) => failure.as_str(),
+                };
+                format!("{}: {state}", observation.agent)
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    true
+}
+
 fn inspect_worktrees(
     age: Duration,
     current: &Path,
@@ -409,7 +440,7 @@ fn inspect_worktrees(
                     Err(_) => ReasonCode::PathUnavailable,
                 }
             };
-            let decision = Decision::new(
+            let mut decision = Decision::new(
                 Target::Worktree {
                     path: tree.path.clone(),
                     branch: tree.branch.clone(),
@@ -417,6 +448,9 @@ fn inspect_worktrees(
                 },
                 reason,
             );
+            if reason == ReasonCode::NotInspected {
+                protect_with_agents(&tree, &mut decision);
+            }
             (tree, decision)
         })
         .collect();
@@ -579,6 +613,10 @@ fn execute(
                 decision.inspection_failed(error.clone());
                 return Err(error);
             }
+        }
+        if protect_with_agents(tree, decision) {
+            record_outcome(&mut report.results, &decision.target, Outcome::Skipped);
+            continue;
         }
         progress.suspend();
         if dry_run {

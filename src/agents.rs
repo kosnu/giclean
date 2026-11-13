@@ -1,9 +1,12 @@
 //! Agent observations are an additional veto, never permission to delete.
 //!
-//! This module does not discover agent homes, read sessions, invoke Git, or
+//! The aggregation API does not discover homes, read sessions, invoke Git, or
 //! change the filesystem. Callers supply detectors and Git worktree roots.
+//! Provider-specific discovery lives in submodules such as [`codex`].
 
 use std::path::Path;
+
+pub mod codex;
 
 /// An observation about one worktree within the detector's documented scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

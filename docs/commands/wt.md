@@ -50,6 +50,14 @@ Git 2.47 以降に加え、認証済みの [GitHub CLI (`gh`)](https://cli.githu
 - 未コミット変更、ステージ済み変更、未追跡ファイル、ignored ファイルがあるもの。
 - index に `assume-unchanged` / `skip-worktree` のエントリがあるもの。`git status` が変更を表示しない可能性があるため、実際に変更がなくても保持します。index のフラグは変更しません。
 - merge・rebase・cherry-pick・revert・bisect などの操作状態、Git の HEAD/index ロックが残るもの。
+- Codex の利用を安全に除外できないもの。初期実装では `CODEX_HOME`（未指定時は
+  `HOME/.codex`）が存在するか、設定・パスを検査できない場合、すべての対象を不明として保持します。
+  loaded-idle・承認/入力待ちも解除しません。履歴本文は読みません。
+
+Codex home があると、終了済み履歴しかなくても削除候補がなくなります。
+対象の home がない非導入環境では既存条件で処理します。別 home・別ユーザー・別ホストは
+観測範囲外で、不在は全環境の未使用証明ではありません。対象範囲・再検査・理由コードは
+[Codex 保護](../agents/codex.md)を参照してください。`batch wt` にも同じ保護が適用されます。
 
 全候補の初期検査を終えてから削除を開始します。初期検査と各操作直前の両方で、`git ls-files --cached -v -z` による index フラグの検査を行います。照会失敗・不正な応答は削除中止とします。各操作直前に一覧・先端・ブランチ・ロック・ローカル変更・更新時刻も再検査し、変わっていれば保持します。削除には強制オプションなしの `git worktree remove -- <path>` を使います。[Git の worktree remove](https://git-scm.com/docs/git-worktree#Documentation/git-worktree.txt-remove)が作業ディレクトリと登録情報を削除します。
 

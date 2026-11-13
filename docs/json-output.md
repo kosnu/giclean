@@ -71,7 +71,11 @@ OID は Git の object format に従います（長さを SHA-1 に固定しな�
 
 保護: `protected_branch`, `branch_in_use`, `symbolic_branch`, `default_branch`, `not_merged`, `main_worktree`, `unborn_head`, `detached_head`, `bare_worktree`, `locked_worktree`, `prunable_worktree`, `current_worktree`, `git_operation`, `index_flags`, `local_changes`, `waiting_period`, `recent_activity`。
 
-不明: `state_changed`, `target_missing`, `path_unavailable`, `no_verified_merge`, `inspection_failed`, `not_inspected`。
+不明: `state_changed`, `target_missing`, `path_unavailable`, `no_verified_merge`, `inspection_failed`, `not_inspected`, `agent_unknown`。
+
+エージェントの live 参照による保護は `agent_active` です。初期の Codex detector は live の確定を
+行わず、対象 home が存在する場合は `agent_unknown`、detail は `codex: incomplete_coverage` などの
+固定分類を返します。対象範囲と保護が広がる制約は [Codex 保護](agents/codex.md)を参照してください。
 
 実行失敗: `deletion_failed`。処理全体の失敗: `cleanup_failed`。
 
