@@ -108,3 +108,63 @@ gitcleanbr() { giclean br "$@"; }
 
 CLI の通常テキスト表現は `render` に置き、理由コードとは独立させています。
 現在の CLI 出力、終了コード、no-fetch、dry-run の挙動は変更しません。
+
+## エージェント検出の境界
+
+`giclean::agents`（`src/lib.rs` から公開）は Git 判定と独立した検出インターフェースです。
+現在は汎用 API と合成 fixture のテストのみで、組み込み detector、セッション探索、
+`wt` への接続はありません。Codex 固有の実装と接続は [#25](https://github.com/kosnu/giclean/issues/25)
+で行います。Claude Code の調査結果は [公開情報調査](agents/claude-code.md)を参照してください。
+
+### detector の契約
+
+`AgentDetector::name(&self) -> &'static str` は固定のエージェント識別子を返し、
+`detect(&self, worktree: &Path) -> Result<AgentState, DetectionFailure>` は対象1本の
+新しい観測を返します。呼び出し側は Git の `worktree list --porcelain -z` を正本とした
+絶対ルートパスと、利用する detector の `&[&dyn AgentDetector]` を渡します。
+home・対応版・同一ホストの範囲は各 detector が明記し、明示設定を優先します。
+共通 API は home の推測や環境変数の読み取り、Git 実行を行いません。
+
+| `AgentState` | 意味 | 集約時の扱い |
+| --- | --- | --- |
+| `Active` | 信頼できる live 情報から対象参照を確認。loaded-idle・承認待ち・入力待ちを含む | `Protection::Active`、保持 |
+| `Historical` | 過去の対象参照のみ確認。現在の非稼働は未確認 | `Protection::Unknown`、保持 |
+| `Unknown` | 使用状態を確定できない | `Protection::Unknown`、保持 |
+| `NoReference` | 設定した情報源の範囲を完全に検査し、対象参照を発見しなかった | 全 detector が同結果の場合だけ `Protection::Clear` |
+
+`NoReference` は範囲外の home・別ホスト・別エージェントを含む未使用証明ではありません。
+live 一覧が空、履歴が古い、archive 済み、lock がない/取得できる、という事実だけでは返せません。
+履歴を見つけたのに live 状態が分からなければ `Historical` または `Unknown` にします。
+情報源の欠落・検査漏れ・未対応形式があれば `Unknown` または `Err` とし、
+「存在しない」と「読めない」を混同しません。解析失敗・部分書込み・権限エラーも同様です。
+
+パス照合は構成要素単位で行い、ルート自身と配下を対象にします。branch 名や origin URL、
+文字列 prefix（`repo` と `repo-old`）だけで関連付けません。symlink・移動/消失したパス・
+ホストの対応が曖昧なら `Unknown` / `PathUncertain` とします。複数 cwd / worktree を
+参照するセッションは、確認できたすべてを保護します。パス照合そのものは detector の責務です。
+
+### 安全な集約と接続手順
+
+`inspect(worktree, detectors) -> Inspection` は全 detector を呼び、
+`observations()` に固定の識別子と元の `Result` を残します。エラーは `ReadFailed`、
+`InvalidData`、`UnsupportedFormat`、`IncompleteCoverage`、`PathUncertain`、`Unavailable`
+の固定分類で、`as_str()` が表示用コードを返します。生の I/O エラーや解析対象を含めません。
+`protection()` は `Active` を最優先し、次に履歴・不明・失敗を `Unknown` にまとめます。
+全件 `NoReference` の場合だけ `Clear`、detector が0件なら `Unknown` です。
+`Active` があっても残りの検査を省略せず、別 detector の失敗情報も保持します。
+
+呼び出し側は `inspection.protection().blocks_deletion()` が true なら保持します。
+`Clear` はエージェント側の追加拒否がないだけで、削除許可ではありません。
+既存の dirty/ignored/locked/操作途中/PR マージ/Git 包含/待機期間の検査はすべて必要です。
+Git 側の `Unknown` を `Clear` で上書きすることはできません。
+
+接続時には dry-run と通常実行で同じ検査を通し、削除直前に対象ごとに再び `inspect` します。
+キャッシュした `Clear` を再利用せず、再検査で参照あり・履歴のみ・不明・失敗に変化したら
+保持します。`Inspection` は観測記録でありロックではありません。再検査直後の開始・resume
+との競合は残るため、原子的な同時実行安全性は保証しません。長期保護には既存の
+`git worktree lock` を利用できます。agent の lock を削除・上書き・掃除しません。
+
+収集するのは判定に必要なメタデータだけです。会話本文・プロンプト・タイトル・指示・
+認証情報は収集/出力せず、外部送信や agent 状態の変更も行いません。テストには合成 fixture
+だけを使い、実セッションを読みません。共通 API の集約・全検出器の呼び出し・再観測は
+`tests/agents.rs` で検証し、agent 固有のパース/パス照合と実 Git 削除経路の検証は接続側で行います。
