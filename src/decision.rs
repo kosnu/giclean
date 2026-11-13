@@ -51,6 +51,8 @@ pub enum ReasonCode {
     NoVerifiedMerge,
     InspectionFailed,
     NotInspected,
+    AgentActive,
+    AgentUnknown,
 }
 
 impl ReasonCode {
@@ -82,6 +84,8 @@ impl ReasonCode {
             Self::NoVerifiedMerge => "no_verified_merge",
             Self::InspectionFailed => "inspection_failed",
             Self::NotInspected => "not_inspected",
+            Self::AgentActive => "agent_active",
+            Self::AgentUnknown => "agent_unknown",
         }
     }
 
@@ -93,6 +97,7 @@ impl ReasonCode {
             | Self::PathUnavailable
             | Self::NoVerifiedMerge
             | Self::InspectionFailed
+            | Self::AgentUnknown
             | Self::NotInspected => Eligibility::Unknown,
             _ => Eligibility::Protected,
         }

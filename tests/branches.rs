@@ -151,7 +151,10 @@ impl Repo {
 
     fn cli(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_giclean"));
-        isolated(&mut command).current_dir(&self.work);
+        isolated(&mut command)
+            .current_dir(&self.work)
+            .env("HOME", &self.root)
+            .env_remove("CODEX_HOME");
         command
     }
 

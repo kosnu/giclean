@@ -112,9 +112,9 @@ CLI の通常テキスト表現は `render` に置き、理由コードとは独
 ## エージェント検出の境界
 
 `giclean::agents`（`src/lib.rs` から公開）は Git 判定と独立した検出インターフェースです。
-現在は汎用 API と合成 fixture のテストのみで、組み込み detector、セッション探索、
-`wt` への接続はありません。Codex 固有の実装と接続は [#25](https://github.com/kosnu/giclean/issues/25)
-で行います。Claude Code の調査結果は [公開情報調査](agents/claude-code.md)を参照してください。
+`wt` は組み込みの `CodexDetector` を通して保護を追加します。Codex の履歴本文や
+DB は読みません。初期実装の対象範囲と制約は [Codex 保護](agents/codex.md)を参照してください。
+Claude Code の調査結果は [公開情報調査](agents/claude-code.md)を参照してください。
 
 ### detector の契約
 
