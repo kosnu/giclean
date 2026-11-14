@@ -67,6 +67,7 @@ enum Action {
     },
     Worktrees {
         age: std::time::Duration,
+        allow_ignored: Vec<std::path::PathBuf>,
         dry_run: bool,
         explain: bool,
     },
@@ -165,12 +166,18 @@ fn main() -> ExitCode {
                 clean_branches(dry_run, &mut out, &mut report)
             }
         }
-        Action::Worktrees { age, dry_run, .. } => {
+        Action::Worktrees {
+            age,
+            dry_run,
+            allow_ignored,
+            ..
+        } => {
             if format == OutputFormat::Json {
-                let result = worktrees::clean(age, dry_run, &mut io::sink(), &mut report);
+                let result =
+                    worktrees::clean(age, dry_run, &allow_ignored, &mut io::sink(), &mut report);
                 json_result(&mut out, "wt", dry_run, &report, result)
             } else {
-                worktrees::clean(age, dry_run, &mut out, &mut report)
+                worktrees::clean(age, dry_run, &allow_ignored, &mut out, &mut report)
             }
         }
     };
