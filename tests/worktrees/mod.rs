@@ -960,3 +960,5 @@ fn batch_keeps_launch_worktree_even_when_discovery_prefers_main() {
     assert!(tree.exists());
     assert!(text(&output.stdout).contains("current worktree"));
 }
+
+mod detached;

@@ -17,6 +17,7 @@ Options:
   --exclude NAME     Skip directories with this exact basename (repeatable)
   --explain          Include existing cleanup explanations
   --days N, --hours N Worktree age options (wt only)
+  --include-detached Check detached HEAD merge evidence (wt only)
   --help             Show help
   --                 Treat remaining arguments as root paths
 
@@ -108,6 +109,7 @@ fn parse(args: &[OsString]) -> Result<Options, String> {
                     return Err("batch currently supports --format text only".into());
                 }
             }
+            Some("--include-detached") if cleanup[0] == "wt" => cleanup.push(arg.clone()),
             Some("--explain") => cleanup.push(arg.clone()),
             Some("--days" | "--hours" | "-d" | "-h") if cleanup[0] == "wt" => {
                 cleanup.push(arg.clone());

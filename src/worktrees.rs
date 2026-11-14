@@ -13,7 +13,7 @@ use crate::{Action, git, git_command_text, git_text, progress::Progress, valid_o
 
 pub const HELP: &str = "giclean wt — Delete inactive merged worktrees
 
-Usage: giclean wt (-d <days> | -h <hours>) [--dry-run] [--explain] [--format text|json]
+Usage: giclean wt (-d <days> | -h <hours>) [--dry-run] [--explain] [--include-detached] [--format text|json]
                   [--allow-ignored <path>]...
 
 Options:
@@ -24,6 +24,7 @@ Options:
   --allow-ignored <path>
                       Permit this regenerable ignored path (repeatable)
   --explain           Explain decisions, including kept worktrees
+  --include-detached  Check detached HEADs using verified PR merge evidence
   --help              Show help (-h means hours for wt)
 
 Requires a GitHub origin and authenticated GitHub CLI (gh).
@@ -41,6 +42,7 @@ pub fn parse_args(args: &[OsString]) -> Result<Action, String> {
     let mut allow_ignored = Vec::new();
     let mut dry_run = false;
     let mut explain = false;
+    let mut include_detached = false;
     let mut args = args.iter();
     while let Some(option) = args.next() {
         if option == "--dry-run" && !dry_run {
@@ -49,6 +51,10 @@ pub fn parse_args(args: &[OsString]) -> Result<Action, String> {
         }
         if option == "--explain" && !explain {
             explain = true;
+            continue;
+        }
+        if option == "--include-detached" && !include_detached {
+            include_detached = true;
             continue;
         }
         if option == "--allow-ignored" {
@@ -71,11 +77,15 @@ pub fn parse_args(args: &[OsString]) -> Result<Action, String> {
             allow_ignored.push(path);
             continue;
         }
-        let unit = match option.to_str() {
-            Some("-d" | "--days") => 86400,
-            Some("-h" | "--hours") => 3600,
-            _ => return Err("use wt (-d <days> | -h <hours>) [--dry-run] [--explain]".into()),
-        };
+        let unit =
+            match option.to_str() {
+                Some("-d" | "--days") => 86400,
+                Some("-h" | "--hours") => 3600,
+                _ => return Err(
+                    "use wt (-d <days> | -h <hours>) [--dry-run] [--explain] [--include-detached]"
+                        .into(),
+                ),
+            };
         if age.is_some() {
             return Err("specify exactly one of --days or --hours".into());
         }
@@ -94,6 +104,7 @@ pub fn parse_args(args: &[OsString]) -> Result<Action, String> {
         allow_ignored,
         dry_run,
         explain,
+        include_detached,
     })
 }
 
@@ -102,10 +113,11 @@ struct Worktree {
     path: PathBuf,
     oid: String,
     branch: Option<String>,
+    detached: bool,
     protection: Option<ReasonCode>,
 }
 
-fn snapshot(progress: &Progress) -> Result<Vec<Worktree>, String> {
+fn snapshot(include_detached: bool, progress: &Progress) -> Result<Vec<Worktree>, String> {
     let output = git_text(&["worktree", "list", "--porcelain", "-z"], progress)?;
     let mut worktrees = Vec::new();
     let mut fields = output.split('\0');
@@ -121,6 +133,7 @@ fn snapshot(progress: &Progress) -> Result<Vec<Worktree>, String> {
             path: PathBuf::from(path),
             oid: String::new(),
             branch: None,
+            detached: false,
             protection: worktrees.is_empty().then_some(ReasonCode::MainWorktree),
         };
         let mut ended = false;
@@ -147,6 +160,7 @@ fn snapshot(progress: &Progress) -> Result<Vec<Worktree>, String> {
                 || field.starts_with("prunable ")
             {
                 let reason = if field == "detached" {
+                    worktree.detached = true;
                     ReasonCode::DetachedHead
                 } else if field == "bare" {
                     ReasonCode::BareWorktree
@@ -155,10 +169,15 @@ fn snapshot(progress: &Progress) -> Result<Vec<Worktree>, String> {
                 } else {
                     ReasonCode::PrunableWorktree
                 };
-                worktree.protection.get_or_insert(reason);
+                if field != "detached" || !include_detached {
+                    worktree.protection.get_or_insert(reason);
+                }
             } else {
                 return Err("cannot parse worktree state".into());
             }
+        }
+        if worktree.detached && worktree.branch.is_some() {
+            return Err("inconsistent detached worktree state".into());
         }
         if !ended || (worktree.oid.is_empty() && worktree.protection.is_none()) {
             return Err("incomplete worktree state".into());
@@ -252,8 +271,11 @@ fn merge_time(
             .filter(|seconds| *seconds > 0)
             .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
             .ok_or("cannot parse PR merge timestamp")?;
-        if fields[1] != worktree.oid
-            || Some(fields[2]) != worktree.branch.as_deref()
+        if (fields[1] != worktree.oid && !(worktree.branch.is_none() && fields[5] == worktree.oid))
+            || worktree
+                .branch
+                .as_deref()
+                .is_some_and(|branch| fields[2] != branch)
             || fields[3] != remote.branch
             || !fields[4].eq_ignore_ascii_case(repo)
             || !ancestor(fields[5], &remote.oid, progress)?
@@ -462,20 +484,22 @@ fn protect_with_agents(tree: &Worktree, decision: &mut Decision) -> bool {
 
 fn inspect_worktrees(
     age: Duration,
+    include_detached: bool,
     allow_ignored: &[PathBuf],
     current: &Path,
     progress: &Progress,
     report: &mut RunReport,
 ) -> Result<WorktreeInspection, String> {
-    let mut entries: Vec<_> = snapshot(progress)?
+    let mut entries: Vec<_> = snapshot(include_detached, progress)?
         .into_iter()
         .map(|tree| {
             let reason = if let Some(reason) = tree.protection {
                 reason
-            } else if tree
-                .branch
-                .as_deref()
-                .is_none_or(|branch| matches!(branch, "main" | "master" | "production"))
+            } else if (tree.branch.is_none() && !tree.detached)
+                || tree
+                    .branch
+                    .as_deref()
+                    .is_some_and(|branch| matches!(branch, "main" | "master" | "production"))
             {
                 ReasonCode::ProtectedBranch
             } else {
@@ -560,21 +584,19 @@ fn inspect_worktree(
     decision: &mut Decision,
 ) -> Result<ReasonCode, String> {
     let (cutoff, allow_ignored) = checks;
-    let branch = tree
-        .branch
-        .as_deref()
-        .expect("unprotected worktree has a branch");
-    if branch == remote.branch {
-        return Ok(ReasonCode::DefaultBranch);
-    }
-    let Some(branch) = branches.get(branch) else {
-        return Ok(ReasonCode::TargetMissing);
-    };
-    if branch.symbolic {
-        return Ok(ReasonCode::SymbolicBranch);
-    }
-    if branch.oid != tree.oid {
-        return Ok(ReasonCode::StateChanged);
+    if let Some(name) = tree.branch.as_deref() {
+        if name == remote.branch {
+            return Ok(ReasonCode::DefaultBranch);
+        }
+        let Some(branch) = branches.get(name) else {
+            return Ok(ReasonCode::TargetMissing);
+        };
+        if branch.symbolic {
+            return Ok(ReasonCode::SymbolicBranch);
+        }
+        if branch.oid != tree.oid {
+            return Ok(ReasonCode::StateChanged);
+        }
     }
     if let Some(reason) = worktree_safety(&tree.path, allow_ignored, progress)? {
         return Ok(reason);
@@ -598,11 +620,12 @@ fn inspect_worktree(
 pub fn clean(
     age: Duration,
     dry_run: bool,
+    include_detached: bool,
     allow_ignored: &[PathBuf],
     out: &mut impl Write,
     report: &mut RunReport,
 ) -> Result<ExitCode, String> {
-    let result = execute(age, dry_run, allow_ignored, out, report);
+    let result = execute(age, dry_run, include_detached, allow_ignored, out, report);
     report.finish(&result);
     result
 }
@@ -610,6 +633,7 @@ pub fn clean(
 fn execute(
     age: Duration,
     dry_run: bool,
+    include_detached: bool,
     allow_ignored: &[PathBuf],
     out: &mut impl Write,
     report: &mut RunReport,
@@ -625,7 +649,14 @@ fn execute(
             .ok_or("cannot find current worktree")?,
     )
     .map_err(|e| e.to_string())?;
-    let inspection = inspect_worktrees(age, allow_ignored, &current, &progress, report)?;
+    let inspection = inspect_worktrees(
+        age,
+        include_detached,
+        allow_ignored,
+        &current,
+        &progress,
+        report,
+    )?;
     let cutoff = inspection.cutoff;
     if cutoff.is_none() {
         progress.finish();
@@ -647,7 +678,7 @@ fn execute(
             continue;
         }
         let recheck: Result<Option<ReasonCode>, String> = (|| {
-            let latest = snapshot(&progress)?;
+            let latest = snapshot(include_detached, &progress)?;
             if !latest.iter().any(|current| current == tree) {
                 return Ok(Some(ReasonCode::StateChanged));
             }
