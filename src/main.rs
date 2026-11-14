@@ -16,6 +16,7 @@ mod render;
 mod ssh;
 #[cfg(unix)]
 mod terminal;
+mod worktree_prune;
 mod worktrees;
 
 use decision::{Decision, Outcome, ReasonCode, RunReport, Target, record_outcome};
@@ -29,6 +30,7 @@ Commands:
   batch          Clean multiple repositories
   br             Delete merged local branches
   wt             Delete inactive merged worktrees
+  wt-prune       Remove stale worktree registrations only
   repos          Discover Git repositories
 
 Options:
@@ -122,6 +124,9 @@ fn main() -> ExitCode {
         return status;
     }
     let args: Vec<_> = env::args_os().skip(1).collect();
+    if let Some(status) = worktree_prune::hook(&args) {
+        return status;
+    }
     if let Some(status) = batch::hook(&args) {
         return status;
     }

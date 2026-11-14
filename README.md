@@ -60,6 +60,7 @@ giclean --help
 
 - [br の仕様・出力・制約](docs/commands/br.md)
 - [wt の仕様・出力・制約](docs/commands/wt.md)
+- [消失した worktree 登録だけの整理: wt-prune](docs/commands/wt-prune.md)
 - [設計・SSH 接続・背景資料](docs/design.md)
 - [開発・検証手順](CONTRIBUTING.md)
 
