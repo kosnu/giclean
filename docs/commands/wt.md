@@ -46,7 +46,7 @@ Git 2.47 以降に加え、認証済みの [GitHub CLI (`gh`)](https://cli.githu
 
 - 主 worktree、現在コマンドを実行している worktree（サブディレクトリからの実行も含む）。
 - `main` / `master` / `production` / `origin` の既定ブランチ、symbolic なローカル参照。
-- ロック済み、detached HEAD、prunable なもの。
+- ロック済み、prunable なもの。detached HEAD も通常は保持します（下記の明示指定時のみ検査）。
 - 未コミット変更、ステージ済み変更、未追跡ファイル、ignored ファイルがあるもの。
 - index に `assume-unchanged` / `skip-worktree` のエントリがあるもの。`git status` が変更を表示しない可能性があるため、実際に変更がなくても保持します。index のフラグは変更しません。
 - merge・rebase・cherry-pick・revert・bisect などの操作状態、Git の HEAD/index ロックが残るもの。
@@ -97,3 +97,24 @@ giclean wt -d 3 --explain            # 理由を表示し、削除対象は削�
 ## JSON 出力
 
 `--format json` で判定理由と実行結果を機械可読形式で出力できます。`--dry-run` と併用できます。仕様と互換性方針は [JSON 出力](../json-output.md) を参照してください。
+
+## detached HEAD の明示的な検査
+
+`--include-detached` を指定した場合だけ、ブランチに所属しない HEAD も検査します。
+`giclean wt -d 3 --include-detached --dry-run --explain` で先に確認できます。
+`batch wt` にも同じオプションを渡せます。
+
+対応する PR の head SHA が HEAD と完全一致する場合、または PR の merge commit SHA
+自体が HEAD と完全一致する場合に限定します。detached HEAD にはブランチ名の一致を
+要求しませんが、PR の対象リポジトリ・既定ブランチ・マージ日時と、マージコミットが
+最新の既定ブランチに含まれることは引き続き確認します。PR head の取り込みは従来と同じ
+祖先関係または immutable なマージコミットに対する完全一致比較で証明します。
+
+既定ブランチの祖先というだけでは、対応 PR の日時が分からないため削除しません。
+squash された変更は完全一致の証拠が得られる場合のみ対象です。「後の修正で意味的には
+取り込み済み」など、内容が異なるものを類似性から推測しません。
+
+主・現在・ロック済み worktree、Git 操作中、ローカル変更・未追跡・ignored ファイル、
+Codex の利用が不明または使用中の保護は解除しません。待機期間は常に呼び出し側の
+`-d` / `-h` に従い、固定の日数はありません。削除直前にも同じ HEAD・detached 状態と
+ローカル変更・活動時刻・エージェント保護を再確認します。
