@@ -1,9 +1,12 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+mod ignored;
 
 use crate::decision::{Decision, Outcome, ReasonCode, RunReport, Target, record_outcome};
 use crate::{Action, git, git_command_text, git_text, progress::Progress, valid_oid};
@@ -11,12 +14,15 @@ use crate::{Action, git, git_command_text, git_text, progress::Progress, valid_o
 pub const HELP: &str = "giclean wt — Delete inactive merged worktrees
 
 Usage: giclean wt (-d <days> | -h <hours>) [--dry-run] [--explain] [--include-detached] [--format text|json]
+                  [--allow-ignored <path>]...
 
 Options:
   -d, --days <days>    Wait this many days after merge or later activity
   -h, --hours <hours>  Wait this many hours after merge or later activity
   --format text|json  Select output format (default: text)
   --dry-run           Show deletion candidates only
+  --allow-ignored <path>
+                      Permit this regenerable ignored path (repeatable)
   --explain           Explain decisions, including kept worktrees
   --include-detached  Check detached HEADs using verified PR merge evidence
   --help              Show help (-h means hours for wt)
@@ -33,6 +39,7 @@ pub fn parse_args(args: &[OsString]) -> Result<Action, String> {
         return Ok(Action::WorktreesHelp);
     }
     let mut age = None;
+    let mut allow_ignored = Vec::new();
     let mut dry_run = false;
     let mut explain = false;
     let mut include_detached = false;
@@ -48,6 +55,26 @@ pub fn parse_args(args: &[OsString]) -> Result<Action, String> {
         }
         if option == "--include-detached" && !include_detached {
             include_detached = true;
+            continue;
+        }
+        if option == "--allow-ignored" {
+            let value = args
+                .next()
+                .ok_or("--allow-ignored requires a relative path")?;
+            let path = PathBuf::from(value);
+            if path.as_os_str().is_empty()
+                || !path
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(name) if !name.to_string_lossy().eq_ignore_ascii_case(".git")))
+                || value
+                    .to_str()
+                    .is_none_or(|value| value.split('/').any(|part| matches!(part, "." | "..")))
+            {
+                return Err(
+                    "--allow-ignored requires a relative path without . / .. / .git".into(),
+                );
+            }
+            allow_ignored.push(path);
             continue;
         }
         let unit =
@@ -74,6 +101,7 @@ pub fn parse_args(args: &[OsString]) -> Result<Action, String> {
     }
     Ok(Action::Worktrees {
         age: age.ok_or("specify --days or --hours")?,
+        allow_ignored,
         dry_run,
         explain,
         include_detached,
@@ -280,7 +308,11 @@ fn at(path: &Path, args: &[&str]) -> Command {
     command
 }
 
-fn worktree_safety(path: &Path, progress: &Progress) -> Result<Option<ReasonCode>, String> {
+fn worktree_safety(
+    path: &Path,
+    allow_ignored: &[PathBuf],
+    progress: &Progress,
+) -> Result<Option<ReasonCode>, String> {
     let git_dir = private_git_dir(path, progress)?;
     for marker in [
         "MERGE_HEAD",
@@ -341,7 +373,15 @@ fn worktree_safety(path: &Path, progress: &Progress) -> Result<Option<ReasonCode
         "status",
         progress,
     )?;
-    Ok((!status.is_empty()).then_some(ReasonCode::LocalChanges))
+    for entry in status.split_terminator('\0') {
+        let Some(relative) = entry.strip_prefix("!! ") else {
+            return Ok(Some(ReasonCode::LocalChanges));
+        };
+        if !ignored::allowed(path, Path::new(relative), allow_ignored)? {
+            return Ok(Some(ReasonCode::LocalChanges));
+        }
+    }
+    Ok(None)
 }
 
 fn modified(path: &Path) -> Result<SystemTime, String> {
@@ -385,7 +425,11 @@ fn latest_modified(path: &Path, skip_git: bool) -> Result<SystemTime, String> {
                 .map_err(|e| format!("cannot inspect {}: {e}", entry.display()))?
             {
                 let child = child.map_err(|e| e.to_string())?.path();
-                if !skip_git || entry != path || child.file_name().is_none_or(|name| name != ".git")
+                if !skip_git
+                    || entry != path
+                    || child
+                        .file_name()
+                        .is_none_or(|name| !name.to_string_lossy().eq_ignore_ascii_case(".git"))
                 {
                     pending.push(child);
                 }
@@ -441,6 +485,7 @@ fn protect_with_agents(tree: &Worktree, decision: &mut Decision) -> bool {
 fn inspect_worktrees(
     age: Duration,
     include_detached: bool,
+    allow_ignored: &[PathBuf],
     current: &Path,
     progress: &Progress,
     report: &mut RunReport,
@@ -504,7 +549,15 @@ fn inspect_worktrees(
             continue;
         }
         decision.evidence.cutoff = Some(cutoff);
-        let result = inspect_worktree(tree, &branches, &repo, &remote, cutoff, progress, decision);
+        let result = inspect_worktree(
+            tree,
+            &branches,
+            &repo,
+            &remote,
+            (cutoff, allow_ignored),
+            progress,
+            decision,
+        );
         match result {
             Ok(reason) => decision.revise(reason),
             Err(error) => {
@@ -526,10 +579,11 @@ fn inspect_worktree(
     branches: &std::collections::BTreeMap<String, crate::Branch>,
     repo: &str,
     remote: &crate::RemoteHead,
-    cutoff: SystemTime,
+    checks: (SystemTime, &[PathBuf]),
     progress: &Progress,
     decision: &mut Decision,
 ) -> Result<ReasonCode, String> {
+    let (cutoff, allow_ignored) = checks;
     if let Some(name) = tree.branch.as_deref() {
         if name == remote.branch {
             return Ok(ReasonCode::DefaultBranch);
@@ -544,7 +598,7 @@ fn inspect_worktree(
             return Ok(ReasonCode::StateChanged);
         }
     }
-    if let Some(reason) = worktree_safety(&tree.path, progress)? {
+    if let Some(reason) = worktree_safety(&tree.path, allow_ignored, progress)? {
         return Ok(reason);
     }
     let merged_at = merge_time(tree, repo, remote, progress)?;
@@ -567,10 +621,11 @@ pub fn clean(
     age: Duration,
     dry_run: bool,
     include_detached: bool,
+    allow_ignored: &[PathBuf],
     out: &mut impl Write,
     report: &mut RunReport,
 ) -> Result<ExitCode, String> {
-    let result = execute(age, dry_run, include_detached, out, report);
+    let result = execute(age, dry_run, include_detached, allow_ignored, out, report);
     report.finish(&result);
     result
 }
@@ -579,6 +634,7 @@ fn execute(
     age: Duration,
     dry_run: bool,
     include_detached: bool,
+    allow_ignored: &[PathBuf],
     out: &mut impl Write,
     report: &mut RunReport,
 ) -> Result<ExitCode, String> {
@@ -593,7 +649,14 @@ fn execute(
             .ok_or("cannot find current worktree")?,
     )
     .map_err(|e| e.to_string())?;
-    let inspection = inspect_worktrees(age, include_detached, &current, &progress, report)?;
+    let inspection = inspect_worktrees(
+        age,
+        include_detached,
+        allow_ignored,
+        &current,
+        &progress,
+        report,
+    )?;
     let cutoff = inspection.cutoff;
     if cutoff.is_none() {
         progress.finish();
@@ -619,7 +682,7 @@ fn execute(
             if !latest.iter().any(|current| current == tree) {
                 return Ok(Some(ReasonCode::StateChanged));
             }
-            if let Some(reason) = worktree_safety(&tree.path, &progress)? {
+            if let Some(reason) = worktree_safety(&tree.path, allow_ignored, &progress)? {
                 return Ok(Some(reason));
             }
             let latest_activity = activity(&tree.path, &progress)?;

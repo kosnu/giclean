@@ -202,3 +202,78 @@ fn batch_accepts_detached_opt_in_without_deleting_in_preview() {
     assert!(text(&output.stdout).contains("candidate:"));
     assert!(tree.exists());
 }
+
+#[test]
+fn detached_and_allowed_generated_paths_require_both_opt_ins() {
+    let repo = Repo::wt();
+    let (tip, merged, tree) = repo.topic("topic", Some("ff"));
+    detach(&repo, &tree);
+    repo.pr(&tip, "topic", &merged, old_time());
+    fs::write(repo.work.join(".git/info/exclude"), "cache/\n").unwrap();
+    fs::create_dir(tree.join("cache")).unwrap();
+    fs::write(tree.join("cache/output"), "regenerable").unwrap();
+    repo.age_tree(&tree);
+    for option in [vec!["--include-detached"], vec!["--allow-ignored", "cache"]] {
+        let output = checked(repo.wt_cli().args(["wt", "-d", "3"]).args(option));
+        assert!(!text(&output.stdout).contains("deleted"));
+        assert!(tree.exists());
+    }
+    let args = [
+        "wt",
+        "-d",
+        "3",
+        "--include-detached",
+        "--allow-ignored",
+        "cache",
+    ];
+    let mut preview = repo.wt_cli();
+    preview.args(args).arg("--dry-run");
+    assert!(text(&checked(&mut preview).stdout).contains("candidate:"));
+    assert!(tree.exists());
+    repo.git_wrapper("for arg do if [ \"$arg\" = --force ]; then exit 99; fi; done");
+    let mut execute = repo.wt_cli();
+    execute.args(args);
+    assert!(text(&checked(&mut execute).stdout).contains(": deleted"));
+    assert!(!tree.exists());
+    assert!(repo.exists("topic"));
+}
+
+#[test]
+fn detached_with_allowed_generated_paths_still_retains_unsafe_trees() {
+    for protection in ["no-pr", "untracked", "dirty", "nested", "recent", "codex"] {
+        let repo = Repo::wt();
+        let (tip, merged, tree) = repo.topic("topic", Some("merge"));
+        detach(&repo, &tree);
+        if protection != "no-pr" {
+            repo.pr(&tip, "topic", &merged, old_time());
+        }
+        fs::write(repo.work.join(".git/info/exclude"), "cache/\n").unwrap();
+        fs::create_dir(tree.join("cache")).unwrap();
+        fs::write(tree.join("cache/output"), "regenerable").unwrap();
+        match protection {
+            "untracked" => fs::write(tree.join("personal"), "keep").unwrap(),
+            "dirty" => fs::write(tree.join("topic"), "local change").unwrap(),
+            "nested" => fs::create_dir(tree.join("cache/.git")).unwrap(),
+            "codex" => fs::create_dir(repo.root.join("codex-home")).unwrap(),
+            _ => {}
+        }
+        repo.age_tree(&tree);
+        if protection == "recent" {
+            set_time(&tree.join("cache/output"), SystemTime::now());
+        }
+        let mut command = repo.wt_cli();
+        if protection == "codex" {
+            command.env("CODEX_HOME", repo.root.join("codex-home"));
+        }
+        let output = checked(command.args([
+            "wt",
+            "-h",
+            "1",
+            "--include-detached",
+            "--allow-ignored",
+            "cache",
+        ]));
+        assert!(!text(&output.stdout).contains("deleted"), "{protection}");
+        assert!(tree.exists(), "{protection}");
+    }
+}

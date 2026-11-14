@@ -16,6 +16,7 @@ mod render;
 mod ssh;
 #[cfg(unix)]
 mod terminal;
+mod worktree_prune;
 mod worktrees;
 
 use decision::{Decision, Outcome, ReasonCode, RunReport, Target, record_outcome};
@@ -29,6 +30,7 @@ Commands:
   batch          Clean multiple repositories
   br             Delete merged local branches
   wt             Delete inactive merged worktrees
+  wt-prune       Remove stale worktree registrations only
   repos          Discover Git repositories
 
 Options:
@@ -68,6 +70,7 @@ enum Action {
     Worktrees {
         age: std::time::Duration,
         include_detached: bool,
+        allow_ignored: Vec<std::path::PathBuf>,
         dry_run: bool,
         explain: bool,
     },
@@ -123,6 +126,9 @@ fn main() -> ExitCode {
         return status;
     }
     let args: Vec<_> = env::args_os().skip(1).collect();
+    if let Some(status) = worktree_prune::hook(&args) {
+        return status;
+    }
     if let Some(status) = batch::hook(&args) {
         return status;
     }
@@ -170,14 +176,28 @@ fn main() -> ExitCode {
             age,
             dry_run,
             include_detached,
+            allow_ignored,
             ..
         } => {
             if format == OutputFormat::Json {
-                let result =
-                    worktrees::clean(age, dry_run, include_detached, &mut io::sink(), &mut report);
+                let result = worktrees::clean(
+                    age,
+                    dry_run,
+                    include_detached,
+                    &allow_ignored,
+                    &mut io::sink(),
+                    &mut report,
+                );
                 json_result(&mut out, "wt", dry_run, &report, result)
             } else {
-                worktrees::clean(age, dry_run, include_detached, &mut out, &mut report)
+                worktrees::clean(
+                    age,
+                    dry_run,
+                    include_detached,
+                    &allow_ignored,
+                    &mut out,
+                    &mut report,
+                )
             }
         }
     };
