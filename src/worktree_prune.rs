@@ -320,17 +320,22 @@ fn verify_commits(path: &Path, refs: &str) -> Result<(), String> {
             ));
         }
     }
-    let dir = path.to_str().ok_or("non-UTF-8 registration")?;
-    let head = git(&["--git-dir", dir, "rev-parse", "--verify", "HEAD^{commit}"])?;
-    git(&[
-        "--git-dir",
-        dir,
-        "diff-index",
-        "--cached",
-        "--quiet",
-        "HEAD",
-        "--",
-    ])
+    // --git-dir alone does not override GIT_INDEX_FILE or GIT_COMMON_DIR.
+    // Bind every registration inspection to its own metadata/object database,
+    // not to repo-local overrides inherited from the invoking Git process.
+    let index = path.join("index");
+    if !fs::symlink_metadata(&index)
+        .map_err(|_| "missing or unreadable registration index; retained")?
+        .is_file()
+    {
+        return Err("registration index is not a regular file; retained".into());
+    }
+    fs::File::open(&index).map_err(|_| "unreadable registration index; retained")?;
+    let head = registration_git(path, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    registration_git(
+        path,
+        &["diff-index", "--cached", "--quiet", head.trim(), "--"],
+    )
     .map_err(|_| "staged or unverifiable index; retained")?;
     let mut commits = BTreeSet::from([head.trim().to_owned()]);
     if let Ok(orig) = fs::read_to_string(path.join("ORIG_HEAD")) {
@@ -364,7 +369,7 @@ fn verify_commits(path: &Path, refs: &str) -> Result<(), String> {
     args.push("--not");
     args.extend(refs.lines());
     args.push("--");
-    if !git(&args)?.trim().is_empty() {
+    if !registration_git(path, &args)?.trim().is_empty() {
         return Err("unique registered HEAD/reflog commits are not reachable from retained refs; entire operation retained".into());
     }
     Ok(())
@@ -383,4 +388,41 @@ fn empty_directories(path: &Path) -> Result<bool, String> {
         }
     }
     Ok(true)
+}
+
+// Preserve the caller's top-level repository selection, but never let it
+// redirect inspection of a specific registration to another index or repo.
+fn registration_git(path: &Path, args: &[&str]) -> Result<String, String> {
+    let mut cmd = command();
+    for key in [
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_SHALLOW_FILE",
+        "GIT_GRAFT_FILE",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_PREFIX",
+        "GIT_INTERNAL_SUPER_PREFIX",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_REPLACE_REF_BASE",
+    ] {
+        cmd.env_remove(key);
+    }
+    let output = cmd
+        .arg("--git-dir")
+        .arg(path)
+        .env("GIT_INDEX_FILE", path.join("index"))
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().into());
+    }
+    String::from_utf8(output.stdout).map_err(|_| "non-UTF-8 registration output; retained".into())
 }

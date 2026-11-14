@@ -42,10 +42,14 @@ impl Repo {
         age(&self.0.join(".git/worktrees").join(name));
     }
     fn run(&self, args: &[&str]) -> Output {
+        self.run_with_env(args, &[])
+    }
+    fn run_with_env(&self, args: &[&str], env: &[(&str, &Path)]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_giclean"))
             .current_dir(&self.0)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .envs(env.iter().copied())
             .arg("wt-prune")
             .args(args)
             .output()
@@ -209,4 +213,95 @@ fn grafted_history_is_retained() {
     fs::write(r.0.join(".git/info/grafts"), "").unwrap();
     assert!(!r.run(&["-h", "1", "--execute"]).status.success());
     assert!(r.exists("safe"));
+}
+
+#[test]
+fn alternate_clean_index_cannot_hide_registered_staged_changes() {
+    let r = Repo::new();
+    r.git(&["worktree", "add", "--detach", "stale"]);
+    fs::write(r.0.join("stale/pending"), "only staged copy").unwrap();
+    r.git(&["-C", "stale", "add", "pending"]);
+    let index = r.0.join(".git/worktrees/stale/index");
+    let original = fs::read(&index).unwrap();
+    fs::remove_dir_all(r.0.join("stale")).unwrap();
+    age(&r.0.join(".git/worktrees/stale"));
+    // Create a clean alternate index even though the initial commit is empty.
+    r.git(&["read-tree", "HEAD"]);
+    for mode in ["--dry-run", "--execute"] {
+        let out = r.run_with_env(
+            &["-h", "1", mode],
+            &[("GIT_INDEX_FILE", &r.0.join(".git/index"))],
+        );
+        assert!(
+            !out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(String::from_utf8_lossy(&out.stderr).contains("index"));
+        assert_eq!(fs::read(&index).unwrap(), original);
+    }
+}
+
+#[test]
+fn dirty_alternate_index_does_not_replace_clean_registration_index() {
+    let r = Repo::new();
+    r.stale("stale", false);
+    fs::write(r.0.join("pending"), "main staged file").unwrap();
+    r.git(&["add", "pending"]);
+    let alternate = r.0.join(".git/index");
+    let original = fs::read(&alternate).unwrap();
+    let out = r.run_with_env(&["-h", "1", "--execute"], &[("GIT_INDEX_FILE", &alternate)]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!r.exists("stale"));
+    assert_eq!(fs::read(alternate).unwrap(), original);
+}
+
+#[test]
+fn missing_or_corrupt_registration_index_is_not_substituted() {
+    for missing in [true, false] {
+        let r = Repo::new();
+        r.stale("stale", false);
+        r.git(&["read-tree", "HEAD"]);
+        let index = r.0.join(".git/worktrees/stale/index");
+        if missing {
+            fs::remove_file(&index).unwrap();
+        } else {
+            fs::write(&index, "corrupt index").unwrap();
+        }
+        age(&r.0.join(".git/worktrees/stale"));
+        let out = r.run_with_env(
+            &["-h", "1", "--execute"],
+            &[("GIT_INDEX_FILE", &r.0.join(".git/index"))],
+        );
+        assert!(!out.status.success());
+        assert!(r.exists("stale"));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("index"));
+    }
+}
+
+#[test]
+fn inherited_repo_selection_does_not_redirect_registration_inspection() {
+    let selected = Repo::new();
+    selected.stale("stale", false);
+    let cwd = Repo::new();
+    cwd.stale("keep", true);
+    let out = cwd.run_with_env(
+        &["-h", "1", "--execute"],
+        &[
+            ("GIT_DIR", &selected.0.join(".git")),
+            ("GIT_COMMON_DIR", &selected.0.join(".git")),
+            ("GIT_WORK_TREE", &selected.0),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!selected.exists("stale"));
+    assert!(cwd.exists("keep"));
 }
