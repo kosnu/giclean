@@ -237,3 +237,85 @@ fn combined_prefix_does_not_consume_flag_shaped_command_values() {
     );
     assert!(!repo.work.join("--audit-log").exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn combined_interactive_records_selected_outcome_and_cancellation() {
+    for audit_first in [true, false] {
+        for cancel in [true, false] {
+            let repo = Repo::new();
+            repo.git(&["branch", "a"]);
+            repo.git(&["branch", "b"]);
+            let config = repo.root.join("settings");
+            fs::write(&config, "wt-days=5\n").unwrap();
+            let log = repo.root.join("interactive.jsonl");
+            let config = config.to_str().unwrap();
+            let path = log.to_str().unwrap();
+            let args = if audit_first {
+                vec![
+                    "--audit-log",
+                    path,
+                    "--config",
+                    config,
+                    "br",
+                    "--interactive",
+                ]
+            } else {
+                vec![
+                    "--config",
+                    config,
+                    "--audit-log",
+                    path,
+                    "br",
+                    "--interactive",
+                ]
+            };
+            let output = interactive(&repo.cli(), &args, "", if cancel { "" } else { "1" });
+            assert_success(&output);
+            assert_eq!(repo.exists("a"), cancel);
+            assert!(repo.exists("b"));
+            let content = fs::read_to_string(&log).unwrap();
+            assert_eq!(content.lines().count(), 2);
+            assert!(content.contains("\"success\":true"));
+            assert_eq!(content.contains("\"outcome\":\"deleted\""), !cancel);
+            assert!(!content.contains(repo.root.to_str().unwrap()));
+        }
+    }
+}
+
+#[test]
+fn combined_interactive_non_tty_and_log_failure_never_delete() {
+    let repo = Repo::new();
+    repo.git(&["branch", "topic"]);
+    let config = repo.root.join("settings");
+    fs::write(&config, "wt-days=5\n").unwrap();
+    let log = repo.root.join("interactive.jsonl");
+    let output = repo
+        .cli()
+        .arg("--config")
+        .arg(&config)
+        .arg("--audit-log")
+        .arg(&log)
+        .args(["br", "--interactive"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(repo.exists("topic"));
+    assert!(
+        fs::read_to_string(&log)
+            .unwrap()
+            .contains("\"success\":false")
+    );
+    let output = repo
+        .cli()
+        .arg("--audit-log")
+        .arg(&log)
+        .arg("--config")
+        .arg(&config)
+        .args(["br", "--interactive"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(text(&output.stderr).contains("audit"));
+    assert!(repo.exists("topic"));
+}
