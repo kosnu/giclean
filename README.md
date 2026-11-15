@@ -91,3 +91,5 @@ bareリポジトリは `bare:` として表示し、その内部は探索しま�
 ## 複数リポジトリの一括処理
 
 `giclean batch br --dry-run ~/dev` で複数リポジトリをまとめて確認し、`--dry-run` を `--execute` に替えて実行します。`batch wt --days 3 --dry-run ~/dev` も利用できます。探索深度・除外・エラー分離などの仕様は [一括クリーンアップ](docs/commands/batch.md) を参照してください。
+
+実行履歴は opt-in です。[保存方針と復旧の限界](docs/audit-history.md)を参照してください。
