@@ -2600,4 +2600,6 @@ fn json_and_explain_together_keep_stdout_machine_readable() {
     assert!(text(&output.stdout).contains("explain:"));
 }
 
+#[path = "explain/audit.rs"]
+mod audit_tests;
 include!("interactive.rs.inc");

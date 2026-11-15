@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::process::{Command, ExitCode, Output, Stdio};
 
+mod audit;
 mod batch;
 mod bulk;
 mod config;
@@ -11,6 +12,7 @@ pub mod decision;
 mod discovery;
 mod explain;
 mod git;
+mod global_options;
 mod json;
 mod progress;
 mod render;
@@ -39,6 +41,7 @@ Options:
   --config PATH  Read explicit defaults (see docs/configuration.md)
   -h, --help     Show help
   -V, --version  Show version
+  --audit-log FILE  Create a private execution log (cleanup commands only)
 
 Run giclean <command> --help for command usage.
 ";
@@ -130,15 +133,28 @@ fn main() -> ExitCode {
     if let Some(status) = bulk::hook() {
         return status;
     }
-    let args = match config::resolve(env::args_os().skip(1).collect()) {
-        Ok(args) => args,
+    let (args, mut audit) = match global_options::prepare(env::args_os().skip(1).collect()) {
+        Ok(value) => value,
         Err(error) => {
             eprintln!("giclean: {error}");
             return ExitCode::from(2);
         }
     };
     let mut report = RunReport::default();
-    if let Some(status) = selection::hook(&args, &mut report) {
+    let status = run(args, &mut report);
+    if let Some(audit) = &mut audit
+        && let Err(error) = audit.finish(status == ExitCode::SUCCESS, &report)
+    {
+        eprintln!(
+            "giclean: audit write failed after execution; changes may already have occurred: {error}"
+        );
+        return ExitCode::FAILURE;
+    }
+    status
+}
+
+fn run(args: Vec<OsString>, report: &mut RunReport) -> ExitCode {
+    if let Some(status) = selection::hook(&args, report) {
         return status;
     }
     if let Some(status) = worktree_prune::hook(&args) {
@@ -180,10 +196,10 @@ fn main() -> ExitCode {
             .map_err(|e| e.to_string()),
         Action::Branches { dry_run, .. } => {
             if format == OutputFormat::Json {
-                let result = clean_branches(dry_run, &mut io::sink(), &mut report);
-                json_result(&mut out, "br", dry_run, &report, result)
+                let result = clean_branches(dry_run, &mut io::sink(), report);
+                json_result(&mut out, "br", dry_run, report, result)
             } else {
-                clean_branches(dry_run, &mut out, &mut report)
+                clean_branches(dry_run, &mut out, report)
             }
         }
         Action::Worktrees {
@@ -200,9 +216,9 @@ fn main() -> ExitCode {
                     include_detached,
                     &allow_ignored,
                     &mut io::sink(),
-                    &mut report,
+                    report,
                 );
-                json_result(&mut out, "wt", dry_run, &report, result)
+                json_result(&mut out, "wt", dry_run, report, result)
             } else {
                 worktrees::clean(
                     age,
@@ -210,13 +226,13 @@ fn main() -> ExitCode {
                     include_detached,
                     &allow_ignored,
                     &mut out,
-                    &mut report,
+                    report,
                 )
             }
         }
     };
     let result = if show_explanation && format == OutputFormat::Text {
-        match explain::write(&report, &mut out) {
+        match explain::write(report, &mut out) {
             Ok(()) => result,
             Err(error) => Err(error.to_string()),
         }
