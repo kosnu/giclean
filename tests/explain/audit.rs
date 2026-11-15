@@ -135,3 +135,105 @@ fn audit_prune_reports_summary_without_claiming_target_results() {
     assert!(content.contains("\"target_results_available\":false"));
     assert!(content.contains("\"results\":[]"));
 }
+
+#[test]
+fn audit_and_config_compose_in_either_prefix_order() {
+    let repo = Repo::new();
+    repo.git(&["branch", "topic"]);
+    let config = repo.root.join("settings");
+    fs::write(&config, "wt-days=5\n").unwrap();
+    for audit_first in [true, false] {
+        let log = repo.root.join(format!("combined-{audit_first}.jsonl"));
+        let mut cmd = repo.cli();
+        if audit_first {
+            cmd.arg("--audit-log")
+                .arg(&log)
+                .arg("--config")
+                .arg(&config);
+        } else {
+            cmd.arg("--config")
+                .arg(&config)
+                .arg("--audit-log")
+                .arg(&log);
+        }
+        assert_success(&cmd.args(["br", "--dry-run"]).output().unwrap());
+        assert!(repo.exists("topic"));
+        let content = fs::read_to_string(log).unwrap();
+        assert!(content.contains("\"outcome\":\"candidate\""));
+        assert!(!content.contains("\"outcome\":\"deleted\""));
+        // No CLI age: wt must receive the configured age before dispatch.
+        let wt_log = repo.root.join(format!("wt-{audit_first}.jsonl"));
+        assert_success(
+            &repo
+                .cli()
+                .arg("--audit-log")
+                .arg(&wt_log)
+                .arg("--config")
+                .arg(&config)
+                .args(["wt", "--dry-run"])
+                .output()
+                .unwrap(),
+        );
+    }
+}
+
+#[test]
+fn combined_prefix_errors_do_not_mutate_or_overwrite() {
+    let repo = Repo::new();
+    repo.git(&["branch", "topic"]);
+    let config = repo.root.join("settings");
+    fs::write(&config, "wt-days=5\n").unwrap();
+    let log = repo.root.join("existing");
+    fs::write(&log, "untouched").unwrap();
+    assert!(
+        !repo
+            .cli()
+            .arg("--config")
+            .arg(&config)
+            .arg("--audit-log")
+            .arg(&log)
+            .arg("br")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert_eq!(fs::read_to_string(&log).unwrap(), "untouched");
+    assert!(repo.exists("topic"));
+    let fresh = repo.root.join("fresh");
+    assert!(
+        !repo
+            .cli()
+            .arg("--audit-log")
+            .arg(&fresh)
+            .arg("--config")
+            .arg(&config)
+            .arg("--audit-log")
+            .arg(&log)
+            .arg("br")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(!fresh.exists());
+    assert!(repo.exists("topic"));
+}
+
+#[test]
+fn combined_prefix_does_not_consume_flag_shaped_command_values() {
+    let repo = Repo::new();
+    let config = repo.root.join("settings");
+    fs::write(&config, "wt-days=5\n").unwrap();
+    // --audit-log is a literal exclusion name here, not a global option.
+    assert_success(
+        &repo
+            .cli()
+            .arg("--config")
+            .arg(&config)
+            .args(["repos", "--exclude", "--audit-log"])
+            .output()
+            .unwrap(),
+    );
+    assert!(!repo.work.join("--audit-log").exists());
+}

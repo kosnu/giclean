@@ -45,3 +45,15 @@ failed / skipped / not_attempted）と Git オブジェクト ID を残す。
 
 復旧コマンドは例であり自動実行しない。既存の名前・パスを上書きせず、
 必要なコミットを実行前に別参照や独立バックアップで保持する。
+
+`--config PATH` と併用するときは、両方ともサブコマンドの前に指定する。
+順序はどちらでもよい（各オプションは一度だけ）。設定の読み取り・検証と
+ログの新規作成が完了するまでクリーンアップを開始しない。
+
+```sh
+giclean --config settings.conf --audit-log /private/logs/run-002.jsonl wt --dry-run
+giclean --audit-log /private/logs/run-003.jsonl --config settings.conf wt --dry-run
+```
+
+サブコマンド以降は通常の CLI 引数として解釈する。値や `--` 以降のパスを
+グローバルオプションとして抜き取らない。

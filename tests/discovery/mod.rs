@@ -284,3 +284,67 @@ fn separate_git_directory_is_skipped_and_main_worktree_wins() {
         vec![row("repository", &linked)]
     );
 }
+
+#[test]
+fn explicit_config_resolves_paths_and_cli_overrides_per_item() {
+    let repo = Repo::new();
+    let config = repo.root.join("defaults.conf");
+    fs::write(
+        &config,
+        "path=repo\nmax-depth=0\nexclude=origin.git\nwt-days=5\n",
+    )
+    .unwrap();
+    let configured = checked(repo.cli().arg("--config").arg(&config).arg("repos"));
+    assert_eq!(rows(&configured), vec![row("repository", &repo.work)]);
+    let overridden = checked(
+        repo.cli()
+            .arg("--config")
+            .arg(&config)
+            .args(["repos", "--max-depth", "3", "--exclude", "repo"])
+            .arg(&repo.root),
+    );
+    assert_eq!(rows(&overridden), vec![row("bare", &repo.origin)]);
+    assert!(!repo.work.join(".git/FETCH_HEAD").exists());
+}
+
+#[test]
+fn configuration_never_supplies_execute_and_invalid_config_stops_before_cleanup() {
+    let repo = Repo::new();
+    let config = repo.root.join("defaults.conf");
+    fs::write(&config, "path=repo\nwt-hours=1\n").unwrap();
+    let output = repo
+        .cli()
+        .arg("--config")
+        .arg(&config)
+        .args(["batch", "wt"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--dry-run"));
+    let output = checked(
+        repo.cli()
+            .arg("--config")
+            .arg(&config)
+            .args(["wt", "--help"]),
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("giclean wt"));
+    fs::write(&config, "wt-days=0\n").unwrap();
+    let output = repo
+        .cli()
+        .arg("--config")
+        .arg(&config)
+        .args(["br", "--dry-run"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let output = repo
+        .cli()
+        .arg("--config")
+        .arg(repo.root.join("missing.conf"))
+        .args(["repos"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!repo.work.join(".git/FETCH_HEAD").exists());
+}

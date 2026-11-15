@@ -7,10 +7,12 @@ use std::process::{Command, ExitCode, Output, Stdio};
 mod audit;
 mod batch;
 mod bulk;
+mod config;
 pub mod decision;
 mod discovery;
 mod explain;
 mod git;
+mod global_options;
 mod json;
 mod progress;
 mod render;
@@ -35,6 +37,7 @@ Commands:
   repos          Discover Git repositories
 
 Options:
+  --config PATH  Read explicit defaults (see docs/configuration.md)
   -h, --help     Show help
   -V, --version  Show version
   --audit-log FILE  Create a private execution log (cleanup commands only)
@@ -127,8 +130,7 @@ fn main() -> ExitCode {
     if let Some(status) = bulk::hook() {
         return status;
     }
-    let args: Vec<_> = env::args_os().skip(1).collect();
-    let (args, mut audit) = match audit::prepare(args) {
+    let (args, mut audit) = match global_options::prepare(env::args_os().skip(1).collect()) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("giclean: {error}");
