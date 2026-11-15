@@ -962,3 +962,26 @@ fn batch_keeps_launch_worktree_even_when_discovery_prefers_main() {
 }
 
 mod detached;
+
+#[test]
+fn interactive_wt_rechecks_changes_after_selection() {
+    for change in [false, true] {
+        let repo = Repo::wt();
+        let (tip, merged, tree) = repo.topic("topic", Some("ff"));
+        repo.pr(&tip, "topic", &merged, old_time());
+        let mutation = if change {
+            format!("printf changed > {}/untracked", quote(&tree))
+        } else {
+            String::new()
+        };
+        let output = interactive(
+            &repo.wt_cli(),
+            &["wt", "-d", "3", "--interactive"],
+            &mutation,
+            "1",
+        );
+        assert_success(&output);
+        assert_eq!(tree.exists(), change, "{}", text(&output.stdout));
+        assert!(repo.exists("topic"));
+    }
+}
