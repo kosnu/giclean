@@ -12,4 +12,6 @@ unsafe_code = "forbid"
 
 [profile.release]
 strip = true
-lto = "thin"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
