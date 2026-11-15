@@ -15,7 +15,9 @@ giclean --audit-log /private/logs/cleanup-001.jsonl wt -d 5
 自動ローテーションや送信はしない。保存期間と削除は利用者が管理する。
 
 JSON Lines の `schema_version: 1` には開始時刻、コマンド種別、dry-run 指定、
-終了時の成功状態を記録する。`br` / `wt` では実行結果（candidate / deleted /
+終了時の成功状態を記録する。`dry_run_token_present` は引数中に `--dry-run`
+というトークンがあったことだけを示す（値として使われる場合もある）。
+読み取り専用の保証ではなく、実際の処理結果は outcome を確認する。`br` / `wt` では実行結果（candidate / deleted /
 failed / skipped / not_attempted）と Git オブジェクト ID を残す。
 パス、リポジトリ名、ブランチ名、リモート URL、セッション内容、ファイル内容、
 任意の引数・エラー本文は残さない。ただしオブジェクト ID もリポジトリを

@@ -51,7 +51,7 @@ fn audit_dry_run_and_failed_commands_are_not_deletions() {
     );
     assert!(repo.exists("topic"));
     let content = fs::read_to_string(log).unwrap();
-    assert!(content.contains("\"dry_run_requested\":true"));
+    assert!(content.contains("\"dry_run_token_present\":true"));
     assert!(content.contains("\"outcome\":\"candidate\""));
     assert!(!content.contains("\"outcome\":\"deleted\""));
     let failed = repo.root.join("failed.jsonl");

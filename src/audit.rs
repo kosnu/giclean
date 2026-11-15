@@ -40,7 +40,7 @@ pub fn prepare(args: Vec<OsString>) -> Result<(Vec<OsString>, Option<Audit>), St
         .map_err(|e| e.to_string())?
         .as_secs();
     let dry_run = filtered.iter().any(|a| a == "--dry-run");
-    writeln!(file, "{{\"schema_version\":1,\"event\":\"started\",\"unix_seconds\":{now},\"command\":\"{command}\",\"dry_run_requested\":{dry_run}}}")
+    writeln!(file, "{{\"schema_version\":1,\"event\":\"started\",\"unix_seconds\":{now},\"command\":\"{command}\",\"dry_run_token_present\":{dry_run}}}")
         .and_then(|()| file.sync_all()).map_err(|e| format!("cannot initialize audit log: {e}"))?;
     let audit = Audit {
         file,
