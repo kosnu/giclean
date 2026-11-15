@@ -985,3 +985,22 @@ fn interactive_wt_rechecks_changes_after_selection() {
         assert!(repo.exists("topic"));
     }
 }
+
+#[test]
+fn interactive_wt_resolves_config_before_selection_and_cli_age_wins() {
+    for override_age in [false, true] {
+        let repo = Repo::wt();
+        let (tip, merged, tree) = repo.topic("topic", Some("ff"));
+        repo.pr(&tip, "topic", &merged, old_time());
+        let config = repo.root.join("selection.conf");
+        fs::write(&config, "wt-days = 3\n").unwrap();
+        let mut args = vec!["--config", config.to_str().unwrap(), "wt", "--interactive"];
+        if override_age {
+            args.extend(["-d", "30"]);
+        }
+        let output = interactive(&repo.wt_cli(), &args, "", "1");
+        assert_success(&output);
+        assert_eq!(tree.exists(), override_age, "{}", text(&output.stdout));
+        assert!(repo.exists("topic"));
+    }
+}
