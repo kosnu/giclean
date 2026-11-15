@@ -6,6 +6,7 @@ use std::process::{Command, ExitCode, Output, Stdio};
 
 mod batch;
 mod bulk;
+mod config;
 pub mod decision;
 mod discovery;
 mod explain;
@@ -34,6 +35,7 @@ Commands:
   repos          Discover Git repositories
 
 Options:
+  --config PATH  Read explicit defaults (see docs/configuration.md)
   -h, --help     Show help
   -V, --version  Show version
 
@@ -125,7 +127,13 @@ fn main() -> ExitCode {
     if let Some(status) = bulk::hook() {
         return status;
     }
-    let args: Vec<_> = env::args_os().skip(1).collect();
+    let args = match config::resolve(env::args_os().skip(1).collect()) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("giclean: {error}");
+            return ExitCode::from(2);
+        }
+    };
     if let Some(status) = worktree_prune::hook(&args) {
         return status;
     }
