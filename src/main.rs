@@ -14,6 +14,7 @@ mod git;
 mod json;
 mod progress;
 mod render;
+mod selection;
 mod ssh;
 #[cfg(unix)]
 mod terminal;
@@ -52,11 +53,13 @@ at one point in the default branch's first-parent history.
 
 Options:
   --format text|json  Select output format (default: text)
+  --interactive  Select individual candidates in a terminal
   --dry-run   Show deletion candidates only
   --explain   Explain decisions, including kept branches
   -h, --help  Show help
 
-Deletes without confirmation. Use --dry-run --explain to preview with reasons.
+Deletes without confirmation unless --interactive is used.
+Use --dry-run --explain to preview with reasons.
 Does not fetch automatically. GitHub CLI is not required.
 ";
 
@@ -134,6 +137,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let mut report = RunReport::default();
+    if let Some(status) = selection::hook(&args, &mut report) {
+        return status;
+    }
     if let Some(status) = worktree_prune::hook(&args) {
         return status;
     }
@@ -150,7 +157,6 @@ fn main() -> ExitCode {
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    let mut report = RunReport::default();
     let show_explanation = matches!(
         &action,
         Action::Branches { explain: true, .. } | Action::Worktrees { explain: true, .. }
@@ -845,13 +851,14 @@ fn clean_branches(
     out: &mut impl Write,
     report: &mut RunReport,
 ) -> Result<ExitCode, String> {
-    let result = execute_branches(dry_run, out, report);
+    let result = execute_branches(dry_run, None, out, report);
     report.finish(&result);
     result
 }
 
 fn execute_branches(
     dry_run: bool,
+    selected: Option<&[Target]>,
     out: &mut impl Write,
     report: &mut RunReport,
 ) -> Result<ExitCode, String> {
@@ -860,7 +867,11 @@ fn execute_branches(
         return Err("run this command inside a Git working tree".into());
     }
     let inspection = inspect_branches(&progress, report)?;
-    let candidates = inspection.candidates;
+    let mut candidates = inspection.candidates;
+    if let Some(selected) = selected {
+        candidates
+            .retain(|_, branch| selected.contains(&branch.decision(ReasonCode::Merged).target));
+    }
     if candidates.is_empty() {
         progress.finish();
         return Ok(ExitCode::SUCCESS);

@@ -20,6 +20,7 @@ Options:
   -d, --days <days>    Wait this many days after merge or later activity
   -h, --hours <hours>  Wait this many hours after merge or later activity
   --format text|json  Select output format (default: text)
+  --interactive       Select individual candidates in a terminal
   --dry-run           Show deletion candidates only
   --allow-ignored <path>
                       Permit this regenerable ignored path (repeatable)
@@ -30,7 +31,8 @@ Options:
 Requires a GitHub origin and authenticated GitHub CLI (gh).
 Uses PR merge time, verifies inclusion with Git, and keeps branches.
 Protects main/current/locked worktrees and worktrees with local files or changes.
-Deletes without confirmation. Use --dry-run --explain to preview with reasons.
+Deletes without confirmation unless --interactive is used.
+Use --dry-run --explain to preview with reasons.
 Does not fetch automatically.
 ";
 
@@ -625,16 +627,26 @@ pub fn clean(
     out: &mut impl Write,
     report: &mut RunReport,
 ) -> Result<ExitCode, String> {
-    let result = execute(age, dry_run, include_detached, allow_ignored, out, report);
+    let result = execute(
+        age,
+        dry_run,
+        include_detached,
+        allow_ignored,
+        None,
+        out,
+        report,
+    );
     report.finish(&result);
     result
 }
 
-fn execute(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn execute(
     age: Duration,
     dry_run: bool,
     include_detached: bool,
     allow_ignored: &[PathBuf],
+    selected: Option<&[crate::Target]>,
     out: &mut impl Write,
     report: &mut RunReport,
 ) -> Result<ExitCode, String> {
@@ -674,7 +686,9 @@ fn execute(
             .iter_mut()
             .find(|d| d.target == initial_decision.target)
             .expect("inspected worktree has a decision");
-        if !decision.is_deletable() {
+        if !decision.is_deletable()
+            || selected.is_some_and(|targets| !targets.contains(&decision.target))
+        {
             continue;
         }
         let recheck: Result<Option<ReasonCode>, String> = (|| {
