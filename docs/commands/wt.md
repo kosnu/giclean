@@ -11,6 +11,10 @@ giclean wt -h 12 --dry-run            # 待機時間を12時間に指定
 
 Git 2.47 以降と、認証済みの [GitHub CLI (`gh`)](https://cli.github.com/) が必要です。`origin` は github.com の HTTPS / SSH URL に対応します。GitHub Enterprise・SSH ホストの別名・他サービスは対象外です。
 
+## 登録だけを整理する
+
+作業フォルダを削除せず、消失した worktree の古い登録だけを整理するには、サブコマンド [`giclean wt prune`](wt-prune.md) を使います。通常の `wt` はこの登録整理を行いません。
+
 ## 何が消える・残るか
 
 対応する PR が `origin` の既定ブランチにマージされ、その変更が最新の既定ブランチに取り込まれていると確認できるものだけが対象です。PR の元コミットと元ブランチ名が、現在の worktree の HEAD とブランチ名に一致する必要があります（detached HEAD の例外は下記参照）。通常マージ・squash・fast-forward に対応します。PR を介さない取り込み、PR と一致しない改名・追加コミット、日時や取り込みを確認できないものは残します。

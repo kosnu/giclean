@@ -7,9 +7,17 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
-const HELP: &str = "giclean wt-prune — Remove stale Git worktree registrations only
+const HELP: &str = "giclean wt prune — Remove stale Git worktree registrations only
 
-Usage: giclean wt-prune (-d <days> | -h <hours>) (--dry-run | --execute)
+Usage: giclean wt prune (-d <days> | -h <hours>) (--dry-run | --execute)
+
+  -d, --days <days>    Wait this many days since registration activity
+  -h, --hours <hours>  Wait this many hours since registration activity
+  --dry-run           Preview candidates without removing registrations
+  --execute           Remove registrations without confirmation
+  --help              Show help
+
+Deprecated alias: giclean wt-prune (warns on stderr).
 
 Requires an explicit positive age and mode. Does not delete worktree directories,
 branches, directly delete commit objects, fetch, or archive unreachable commits. Git's prunable signal

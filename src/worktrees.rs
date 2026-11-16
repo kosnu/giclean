@@ -16,6 +16,10 @@ pub const HELP: &str = "giclean wt — Delete inactive merged worktrees
 Usage: giclean wt (-d <days> | -h <hours>) [--dry-run] [--explain] [--include-detached] [--format text|json]
                   [--allow-ignored <path>]...
 
+Subcommands:
+  prune  Remove stale registrations only, not worktree directories or branches
+         See giclean wt prune --help
+
 Options:
   -d, --days <days>    Wait this many days after merge or later activity
   -h, --hours <hours>  Wait this many hours after merge or later activity

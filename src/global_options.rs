@@ -24,6 +24,14 @@ pub fn prepare(
         );
     }
     let mut args: Vec<_> = iter.collect();
+    // Normalize only the command position, before defaults and audit classify it.
+    // Keep the internal command ID stable for existing audit consumers.
+    if args.first().is_some_and(|a| a == "wt-prune") {
+        eprintln!("giclean: wt-prune is deprecated; use `giclean wt prune` instead.");
+    } else if args.first().is_some_and(|a| a == "wt") && args.get(1).is_some_and(|a| a == "prune") {
+        args.remove(1);
+        args[0] = "wt-prune".into();
+    }
     if let Some(path) = config {
         args.splice(0..0, [OsString::from("--config"), path]);
         args = crate::config::resolve(args)?;

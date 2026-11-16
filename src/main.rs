@@ -34,7 +34,7 @@ Commands:
   batch          Clean multiple repositories
   br             Delete merged local branches
   wt             Delete inactive merged worktrees
-  wt-prune       Remove stale worktree registrations only
+  wt prune       Remove stale worktree registrations only
   repos          Discover Git repositories
 
 Options:
