@@ -328,6 +328,7 @@ fn verify_commits(path: &Path, refs: &str) -> Result<(), String> {
             "ORIG_HEAD",
             "COMMIT_EDITMSG",
             "config.worktree",
+            "FETCH_HEAD",
         ]
         .iter()
         .any(|allowed| name == *allowed)
@@ -355,6 +356,7 @@ fn verify_commits(path: &Path, refs: &str) -> Result<(), String> {
     )
     .map_err(|_| "staged or unverifiable index; retained")?;
     let mut commits = BTreeSet::from([head.trim().to_owned()]);
+    add_fetch_heads(path, &mut commits)?;
     if let Ok(orig) = fs::read_to_string(path.join("ORIG_HEAD")) {
         commits.insert(orig.trim().into());
     }
@@ -387,7 +389,45 @@ fn verify_commits(path: &Path, refs: &str) -> Result<(), String> {
     args.extend(refs.lines());
     args.push("--");
     if !registration_git(path, &args)?.trim().is_empty() {
-        return Err("unique registered HEAD/reflog commits are not reachable from retained refs; entire operation retained".into());
+        return Err("unique registered HEAD/reflog/FETCH_HEAD commits are not reachable from retained refs; entire operation retained".into());
+    }
+    Ok(())
+}
+
+// FETCH_HEAD can be the only remaining name for a fetched commit. Include
+// every record, including not-for-merge, rather than discarding a known file.
+fn add_fetch_heads(path: &Path, commits: &mut BTreeSet<String>) -> Result<(), String> {
+    let file = path.join("FETCH_HEAD");
+    match fs::symlink_metadata(&file) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Ok(metadata) if metadata.is_file() => {}
+        _ => return Err("unreadable or nonregular FETCH_HEAD; retained".into()),
+    }
+    let contents = fs::read_to_string(&file).map_err(|_| "unreadable FETCH_HEAD; retained")?;
+    if contents.contains('\r') || (!contents.is_empty() && !contents.ends_with('\n')) {
+        return Err("malformed FETCH_HEAD; retained".into());
+    }
+    let mut fetched = BTreeSet::new();
+    for line in contents.lines() {
+        let mut fields = line.splitn(3, '\t');
+        let oid = fields.next().unwrap_or("");
+        let merge = fields.next();
+        let description = fields.next();
+        if !crate::valid_oid(oid)
+            || !matches!(merge, Some("" | "not-for-merge"))
+            || description.is_none_or(|value| value.is_empty() || value.contains(['\t', '\r']))
+        {
+            return Err("malformed FETCH_HEAD; retained".into());
+        }
+        fetched.insert(oid.to_owned());
+    }
+    for oid in fetched {
+        // A tag object's distinct identity is not proven safe by reachability
+        // of its peeled commit alone. Keep non-commit objects conservatively.
+        if registration_git(path, &["cat-file", "-t", &oid])?.trim() != "commit" {
+            return Err("non-commit FETCH_HEAD object cannot be verified; retained".into());
+        }
+        commits.insert(oid);
     }
     Ok(())
 }
@@ -420,8 +460,8 @@ fn verify_worktree_config(path: &Path) -> Result<(), String> {
         return Err("config.worktree is not a regular file; retained".into());
     }
     // Explicit file scope and --no-includes parse syntax without following any
-    // includes. Only known checkout booleans are accepted; unknown keys are not
-    // harmless merely because Git itself recognizes their syntax.
+    // includes. Accept only vetted checkout booleans and inert Codex metadata;
+    // unknown keys are not harmless merely because Git recognizes their syntax.
     let output = command()
         .args(["config", "--no-includes", "--null", "--list", "--file"])
         .arg(path)
@@ -434,6 +474,13 @@ fn verify_worktree_config(path: &Path) -> Result<(), String> {
         String::from_utf8(output.stdout).map_err(|_| "non-UTF-8 config.worktree; retained")?;
     for record in contents.split_terminator('\0') {
         let (key, value) = record.split_once('\n').unwrap_or((record, "true"));
+        // Git does not interpret this Codex-owned pointer as a Git config
+        // include or repository/index setting. Never open its target; pruning
+        // removes the registration, not the referenced environment file.
+        // Git normalizes section/key casing; do not allow other codex.* keys.
+        if key == "codex.localenvironmentconfigpath" {
+            continue;
+        }
         if !matches!(
             key,
             "core.bare" | "core.sparsecheckout" | "core.sparsecheckoutcone" | "index.sparse"

@@ -579,7 +579,7 @@ fn recent_config_and_unknown_info_files_are_retained() {
 #[test]
 fn symlink_config_or_sparse_patterns_are_retained() {
     use std::os::unix::fs::symlink;
-    for name in ["config.worktree", "info/sparse-checkout"] {
+    for name in ["config.worktree", "info/sparse-checkout", "FETCH_HEAD"] {
         let r = Repo::new();
         r.stale("keep", false);
         let admin = r.0.join(".git/worktrees/keep");
@@ -614,5 +614,197 @@ fn split_index_metadata_remains_retained() {
     let out = r.run(&["-d", "5", "--execute"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("sharedindex."));
+    assert!(r.exists("keep"));
+}
+
+#[test]
+fn codex_environment_pointer_is_inert_and_case_insensitive() {
+    for key in [
+        "codex.localenvironmentconfigpath",
+        "CoDeX.LocalEnvironmentConfigPath",
+    ] {
+        let r = Repo::new();
+        configured_worktree(&r, "stale");
+        let target = r.0.join("environment files/local settings.toml");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        // Not Git config: success demonstrates the pointer is not an include.
+        fs::write(&target, "environment metadata, not Git configuration\n").unwrap();
+        r.git(&[
+            "-C",
+            "stale",
+            "config",
+            "--worktree",
+            key,
+            target.to_str().unwrap(),
+        ]);
+        fs::remove_dir_all(r.0.join("stale")).unwrap();
+        let admin = r.0.join(".git/worktrees/stale");
+        age(&admin);
+        let config = fs::read(admin.join("config.worktree")).unwrap();
+        let out = r.run(&["-d", "5", "--dry-run"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(fs::read(admin.join("config.worktree")).unwrap(), config);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "Would prune registration stale\n"
+        );
+        let out = r.run(&["-d", "5", "--execute"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!r.exists("stale"));
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "environment metadata, not Git configuration\n"
+        );
+    }
+}
+
+#[test]
+fn codex_pointer_does_not_allow_other_keys_or_unique_history() {
+    for extra in [
+        "codex.other",
+        "core.worktree",
+        "include.path",
+        "unique-history",
+    ] {
+        let r = Repo::new();
+        r.stale("safe", false);
+        r.git(&["config", "extensions.worktreeConfig", "true"]);
+        r.git(&["worktree", "add", "--detach", "keep"]);
+        r.git(&[
+            "-C",
+            "keep",
+            "config",
+            "--worktree",
+            "codex.localEnvironmentConfigPath",
+            "nonexistent config with spaces.toml",
+        ]);
+        if extra == "unique-history" {
+            r.git(&["-C", "keep", "commit", "--allow-empty", "-m", "unique"]);
+        } else {
+            r.git(&["-C", "keep", "config", "--worktree", extra, "unverified"]);
+        }
+        fs::remove_dir_all(r.0.join("keep")).unwrap();
+        age(&r.0.join(".git/worktrees/keep"));
+        let out = r.run(&["-d", "5", "--execute"]);
+        assert!(!out.status.success(), "{extra}");
+        assert!(r.exists("safe") && r.exists("keep"));
+    }
+}
+
+#[test]
+fn fetched_commit_is_verified_even_when_not_for_merge() {
+    for unique in [false, true] {
+        for not_for_merge in [false, true] {
+            let r = Repo::new();
+            let donor = Repo::new();
+            donor.git(&["commit", "--allow-empty", "-m", "unique fetched commit"]);
+            r.stale("safe", false);
+            r.git(&["worktree", "add", "--detach", "keep"]);
+            let remote = if unique { &donor.0 } else { &r.0 };
+            r.git(&[
+                "-C",
+                "keep",
+                "fetch",
+                "--no-tags",
+                remote.to_str().unwrap(),
+                "main",
+            ]);
+            let admin = r.0.join(".git/worktrees/keep");
+            let fetch_head = admin.join("FETCH_HEAD");
+            let original = fs::read_to_string(&fetch_head).unwrap();
+            let record = if not_for_merge {
+                original.replacen("\t\t", "\tnot-for-merge\t", 1)
+            } else {
+                original
+            };
+            // Duplicate fetch records are ordinary and must not lose protection.
+            fs::write(&fetch_head, format!("{record}{record}")).unwrap();
+            fs::remove_dir_all(r.0.join("keep")).unwrap();
+            age(&admin);
+            let out = r.run(&["-d", "5", "--execute"]);
+            assert_eq!(
+                out.status.success(),
+                !unique,
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(r.exists("keep"), unique);
+            assert_eq!(r.exists("safe"), unique);
+            if unique {
+                assert!(String::from_utf8_lossy(&out.stderr).contains("HEAD/reflog/FETCH_HEAD"));
+            }
+        }
+    }
+}
+
+#[test]
+fn empty_fetch_head_is_safe_but_malformed_or_noncommit_records_are_retained() {
+    for kind in [
+        "empty",
+        "malformed",
+        "bad-marker",
+        "missing-description",
+        "tag",
+        "tree",
+    ] {
+        let r = Repo::new();
+        r.stale("keep", false);
+        let admin = r.0.join(".git/worktrees/keep");
+        let head = fs::read_to_string(admin.join("HEAD")).unwrap();
+        let oid = head.trim();
+        let contents = match kind {
+            "empty" => String::new(),
+            "malformed" => format!("{oid} no tabs\n"),
+            "bad-marker" => format!("{oid}\tother\tbranch main\n"),
+            "missing-description" => format!("{oid}\t\t\n"),
+            "tag" | "tree" => {
+                r.git(&["tag", "-a", "fetched-tag", "-m", "annotated", "HEAD"]);
+                let revision = if kind == "tag" {
+                    "fetched-tag"
+                } else {
+                    "HEAD^{tree}"
+                };
+                let output = Command::new("git")
+                    .current_dir(&r.0)
+                    .args(["rev-parse", revision])
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                format!(
+                    "{}\t\tfetched object\n",
+                    String::from_utf8(output.stdout).unwrap().trim()
+                )
+            }
+            _ => unreachable!(),
+        };
+        fs::write(admin.join("FETCH_HEAD"), contents).unwrap();
+        age(&admin);
+        let out = r.run(&["-d", "5", "--execute"]);
+        assert_eq!(
+            out.status.success(),
+            kind == "empty",
+            "{kind}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(r.exists("keep"), kind != "empty");
+    }
+}
+
+#[test]
+fn codex_thread_metadata_remains_protected() {
+    let r = Repo::new();
+    r.stale("keep", false);
+    let admin = r.0.join(".git/worktrees/keep");
+    fs::write(admin.join("codex-thread.json"), "{}").unwrap();
+    age(&admin);
+    assert!(!r.run(&["-d", "5", "--execute"]).status.success());
     assert!(r.exists("keep"));
 }
