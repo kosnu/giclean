@@ -1,25 +1,37 @@
-# 複数リポジトリの一括クリーンアップ
+# batch: 複数リポジトリをまとめて整理する
 
 ```sh
-giclean batch br --dry-run --explain ~/dev
-giclean batch br --execute --max-depth 4 --exclude node_modules ~/dev
-giclean batch wt --days 3 --dry-run ~/dev ~/work
-giclean batch wt --hours 72 --execute ~/dev
+giclean batch br --dry-run --explain ~/dev              # 候補と保持理由を確認
+giclean batch br --execute ~/dev                        # 確認なしで削除
+giclean batch wt --days 3 --dry-run ~/dev ~/work         # worktree の候補を確認
+giclean batch wt --days 3 --execute ~/dev                # 確認なしで削除
 ```
 
-`batch br` / `batch wt` は `repos` と同じ探索・重複排除を使い、発見した各リポジトリのディレクトリで既存の `br` / `wt` を起動します。通常の単一リポジトリコマンドの挙動は変えません。一括処理では **`--dry-run` または `--execute` のいずれかが必須**です。`--execute` は確認なしで削除します。
+**`--dry-run` または `--execute` のどちらかが必須です。** 発見したリポジトリごとに [br](br.md) / [wt](wt.md) と同じ削除・保護条件を使います。自動 fetch はしません。`wt` には github.com の `origin` と認証済み `gh` が必要です。
 
-- パス省略時は現在のディレクトリ。ルートが深度0、既定の最大深度は3です。
-- `--exclude NAME` は正確に一致するディレクトリ名を除外し、複数回指定できます。globは展開しません。
-- `--` 以降はすべて探索パスとして扱います。
-- シンボリックリンクは追跡しません。linked worktree は common Git directory で重複排除し、探索範囲内の主 worktree を優先します。
-- 起動元が同じリポジトリのworktree内なら、そのworktreeを実行場所として優先し、元のcurrent worktree保護を維持します。
-- bare repository はスキップします。
-- 子プロセス起動直前にもリポジトリの同一性を再確認します。既存の保護条件、マージ判定、削除直前の再検査を省略しません。自動fetchは行いません。
-- `wt` では従来どおりGitHubのoriginと認証済み`gh`が必要です。
+## 探索する範囲
 
-探索・リポジトリ処理でエラーがあっても他の有効なリポジトリを処理します。**トランザクションではありません。途中のエラー時にも他のリポジトリで削除が実行される場合があります。** 結果はリポジトリパスの見出しごとに出力し、最後に成功・失敗・スキップ数を表示します。探索エラーはstderrに別途表示されます。終了コードは全処理成功で0、探索またはクリーンアップ失敗で1、引数エラーで2です。対象0件は成功です。
+| 指定 | 動作 |
+| --- | --- |
+| パス | 複数指定可能。省略時は現在のディレクトリ |
+| `--max-depth N` | 探索の深さ。指定ルートが0、既定は3 |
+| `--exclude NAME` | 同名のディレクトリを除外。複数指定可能。glob ではない |
+| `--` | 以降をすべて探索パスとして扱う |
 
-一括出力は現在textのみです。`--format json`は削除前に引数エラーになります。JSONが必要な場合は各リポジトリで既存の`br` / `wt --format json`を実行してください。
+[設定ファイル](../configuration.md)で探索範囲や `wt` の待機時間を指定した場合はその値を使い、CLI で指定すると上書きします。実行モードは毎回明示が必要です。
 
-環境変数による別リポジトリへの誤操作を防ぐため、`GIT_DIR`、`GIT_WORK_TREE`、`GIT_COMMON_DIR`、`GIT_INDEX_FILE`、`GIT_OBJECT_DIRECTORY`、`GIT_ALTERNATE_OBJECT_DIRECTORIES`、`GIT_NAMESPACE`、`GIT_SHALLOW_FILE`、`GIT_CONFIG`、`GIT_CONFIG_COUNT`、`GIT_CONFIG_PARAMETERS`が設定されている場合は、探索・削除前に中止します。通常のグローバル設定、credential helper、SSH設定は引き継ぎます。
+- シンボリックリンクをたどらず、bare リポジトリは処理しません。
+- 同じリポジトリの worktree は重複して処理しません。探索範囲内の主 worktree を優先しますが、現在いる worktree の保護は維持します。
+- `wt` の `--include-detached` は使えます。`--allow-ignored`・`--interactive`・JSON 出力は使えません。必要なら各リポジトリで単体のコマンドを実行してください。
+
+## 出力と失敗時の動作
+
+結果はリポジトリごとに表示し、最後に成功・失敗・スキップ数を表示します。探索エラーは標準エラーに出ます。対象が0件でも正常終了です。
+
+**途中で失敗しても、他のリポジトリでは削除される場合があります。成功済みの削除は取り消しません。** 対象範囲を dry-run で確認し、実行後はリポジトリごとの結果を確認してください。
+
+別のリポジトリへ誤操作するおそれのある Git 環境変数（`GIT_DIR`・`GIT_WORK_TREE` など）が設定されている場合は、探索・削除前に中止します。エラーに示された設定を確認してください。通常の Git グローバル設定、認証・SSH 設定は引き継ぎます。
+
+終了コードは全処理成功が `0`、探索または整理の失敗が `1`、引数不正が `2` です。
+
+実行履歴は既定で保存しません。[実行履歴と復旧の限界](../audit-history.md)を参照してください。
