@@ -306,8 +306,16 @@ fn collect(
 }
 
 fn verify_commits(path: &Path, refs: &str) -> Result<(), String> {
+    // Validate before any command opens this registration as a repository.
+    // Per-worktree config is loaded before -c overrides, including includes.
+    if path.join("config.worktree").exists() {
+        verify_worktree_config(&path.join("config.worktree"))?;
+    }
     for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
         let name = entry.map_err(|e| e.to_string())?.file_name();
+        if name == "info" && sparse_checkout_only(&path.join(&name))? {
+            continue;
+        }
         if name == "refs" && empty_directories(&path.join(&name))? {
             continue;
         }
@@ -319,6 +327,7 @@ fn verify_commits(path: &Path, refs: &str) -> Result<(), String> {
             "logs",
             "ORIG_HEAD",
             "COMMIT_EDITMSG",
+            "config.worktree",
         ]
         .iter()
         .any(|allowed| name == *allowed)
@@ -379,6 +388,71 @@ fn verify_commits(path: &Path, refs: &str) -> Result<(), String> {
     args.push("--");
     if !registration_git(path, &args)?.trim().is_empty() {
         return Err("unique registered HEAD/reflog commits are not reachable from retained refs; entire operation retained".into());
+    }
+    Ok(())
+}
+
+// Git's sparse-checkout writes this exact worktree-local file. Other info
+// files, split-index files and per-worktree refs remain unverified and retained.
+fn sparse_checkout_only(path: &Path) -> Result<bool, String> {
+    if !fs::symlink_metadata(path)
+        .map_err(|e| e.to_string())?
+        .is_dir()
+    {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if entry.file_name() != "sparse-checkout"
+            || !entry.file_type().map_err(|e| e.to_string())?.is_file()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn verify_worktree_config(path: &Path) -> Result<(), String> {
+    if !fs::symlink_metadata(path)
+        .map_err(|e| e.to_string())?
+        .is_file()
+    {
+        return Err("config.worktree is not a regular file; retained".into());
+    }
+    // Explicit file scope and --no-includes parse syntax without following any
+    // includes. Only known checkout booleans are accepted; unknown keys are not
+    // harmless merely because Git itself recognizes their syntax.
+    let output = command()
+        .args(["config", "--no-includes", "--null", "--list", "--file"])
+        .arg(path)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err("invalid or unreadable config.worktree; retained".into());
+    }
+    let contents =
+        String::from_utf8(output.stdout).map_err(|_| "non-UTF-8 config.worktree; retained")?;
+    for record in contents.split_terminator('\0') {
+        let (key, value) = record.split_once('\n').unwrap_or((record, "true"));
+        if !matches!(
+            key,
+            "core.bare" | "core.sparsecheckout" | "core.sparsecheckoutcone" | "index.sparse"
+        ) {
+            return Err(format!("unsupported config.worktree key {key:?}; retained"));
+        }
+        let value = value.to_ascii_lowercase();
+        let boolean = match value.as_str() {
+            "true" | "yes" | "on" | "1" => true,
+            "false" | "no" | "off" | "0" | "" => false,
+            _ => {
+                return Err(format!(
+                    "unverifiable config.worktree boolean {key:?}; retained"
+                ));
+            }
+        };
+        if key == "core.bare" && boolean {
+            return Err("bare config.worktree cannot be verified; retained".into());
+        }
     }
     Ok(())
 }

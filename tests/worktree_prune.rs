@@ -446,3 +446,173 @@ fn batch_still_treats_prune_as_a_root_path_not_a_subcommand() {
     assert!(!String::from_utf8_lossy(&out.stdout).contains("registration"));
     assert!(out.stderr.is_empty());
 }
+
+fn configured_worktree(r: &Repo, name: &str) {
+    fs::create_dir_all(r.0.join("src")).unwrap();
+    fs::create_dir_all(r.0.join("docs")).unwrap();
+    fs::write(r.0.join("src/kept"), "tracked").unwrap();
+    fs::write(r.0.join("docs/hidden"), "outside sparse checkout").unwrap();
+    r.git(&["add", "src", "docs"]);
+    r.git(&["commit", "-m", "tracked files"]);
+    r.git(&["config", "extensions.worktreeConfig", "true"]);
+    r.git(&["worktree", "add", "--detach", name]);
+    r.git(&["-C", name, "config", "--worktree", "core.bare", "false"]);
+    r.git(&[
+        "-C",
+        name,
+        "sparse-checkout",
+        "set",
+        "--cone",
+        "--sparse-index",
+        "src",
+    ]);
+}
+
+#[test]
+fn git_generated_sparse_config_and_patterns_can_be_pruned() {
+    let r = Repo::new();
+    configured_worktree(&r, "stale");
+    let admin = r.0.join(".git/worktrees/stale");
+    assert!(admin.join("config.worktree").is_file());
+    assert!(admin.join("info/sparse-checkout").is_file());
+    fs::remove_dir_all(r.0.join("stale")).unwrap();
+    age(&admin);
+    let before = fs::read(admin.join("config.worktree")).unwrap();
+    let preview = r.run(&["-d", "5", "--dry-run"]);
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&preview.stdout),
+        "Would prune registration stale\n"
+    );
+    assert_eq!(fs::read(admin.join("config.worktree")).unwrap(), before);
+    let execute = r.run(&["-d", "5", "--execute"]);
+    assert!(
+        execute.status.success(),
+        "{}",
+        String::from_utf8_lossy(&execute.stderr)
+    );
+    assert!(!r.exists("stale"));
+}
+
+#[test]
+fn config_does_not_bypass_staged_or_unique_commit_protection() {
+    for unique in [false, true] {
+        let r = Repo::new();
+        r.stale("safe", false);
+        configured_worktree(&r, "keep");
+        if unique {
+            r.git(&["-C", "keep", "commit", "--allow-empty", "-m", "unique"]);
+        } else {
+            fs::create_dir_all(r.0.join("keep/src")).unwrap();
+            fs::write(r.0.join("keep/src/pending"), "staged only").unwrap();
+            r.git(&["-C", "keep", "add", "src/pending"]);
+        }
+        fs::remove_dir_all(r.0.join("keep")).unwrap();
+        age(&r.0.join(".git/worktrees/keep"));
+        let out = r.run(&["-d", "5", "--execute"]);
+        assert!(!out.status.success());
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            error.contains(if unique {
+                "unique registered"
+            } else {
+                "staged or unverifiable index"
+            }),
+            "{error}"
+        );
+        assert!(r.exists("safe") && r.exists("keep"));
+    }
+}
+
+#[test]
+fn unsupported_or_invalid_config_retains_all_registrations() {
+    for config in [
+        "[core]\nworktree = ../elsewhere\n",
+        "[core]\nbare = true\n",
+        "[core]\nsparseCheckout = invalid\n",
+        "[include]\npath = ordinary-extra-config\n",
+        "[user]\nname = Test\n",
+        "[invalid\n",
+    ] {
+        let r = Repo::new();
+        r.stale("safe", false);
+        r.stale("keep", false);
+        let admin = r.0.join(".git/worktrees/keep");
+        fs::write(admin.join("config.worktree"), config).unwrap();
+        age(&admin);
+        let out = r.run(&["-d", "5", "--execute"]);
+        assert!(!out.status.success(), "{config}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("config.worktree"),
+            "{config}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(r.exists("safe") && r.exists("keep"));
+    }
+}
+
+#[test]
+fn recent_config_and_unknown_info_files_are_retained() {
+    for unknown_info in [false, true] {
+        let r = Repo::new();
+        configured_worktree(&r, "keep");
+        fs::remove_dir_all(r.0.join("keep")).unwrap();
+        let admin = r.0.join(".git/worktrees/keep");
+        age(&admin);
+        if unknown_info {
+            fs::write(admin.join("info/unknown"), "keep").unwrap();
+            age(&admin);
+        } else {
+            fs::write(admin.join("config.worktree"), "[core]\nbare = false\n").unwrap();
+        }
+        let out = r.run(&["-d", "5", "--execute"]);
+        assert!(!out.status.success());
+        assert!(r.exists("keep"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_config_or_sparse_patterns_are_retained() {
+    use std::os::unix::fs::symlink;
+    for name in ["config.worktree", "info/sparse-checkout"] {
+        let r = Repo::new();
+        r.stale("keep", false);
+        let admin = r.0.join(".git/worktrees/keep");
+        fs::create_dir_all(admin.join("info")).unwrap();
+        let target = r.0.join("ordinary-file");
+        fs::write(&target, "").unwrap();
+        symlink(&target, admin.join(name)).unwrap();
+        let out = r.run(&["-d", "5", "--execute"]);
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("symlink"));
+        assert!(r.exists("keep"));
+        assert!(target.exists());
+    }
+}
+
+#[test]
+fn split_index_metadata_remains_retained() {
+    let r = Repo::new();
+    configured_worktree(&r, "keep");
+    r.git(&["-C", "keep", "sparse-checkout", "disable"]);
+    r.git(&["-C", "keep", "update-index", "--split-index"]);
+    let admin = r.0.join(".git/worktrees/keep");
+    assert!(fs::read_dir(&admin).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("sharedindex.")
+    }));
+    fs::remove_dir_all(r.0.join("keep")).unwrap();
+    age(&admin);
+    let out = r.run(&["-d", "5", "--execute"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("sharedindex."));
+    assert!(r.exists("keep"));
+}
