@@ -50,7 +50,7 @@ impl Repo {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .envs(env.iter().copied())
-            .arg("wt-prune")
+            .args(["wt", "prune"])
             .args(args)
             .output()
             .unwrap()
@@ -304,4 +304,145 @@ fn inherited_repo_selection_does_not_redirect_registration_inspection() {
     );
     assert!(!selected.exists("stale"));
     assert!(cwd.exists("keep"));
+}
+
+fn cli(repo: &Repo, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_giclean"))
+        .current_dir(&repo.0)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+const WARNING: &str = "giclean: wt-prune is deprecated; use `giclean wt prune` instead.\n";
+
+#[test]
+fn alias_and_canonical_have_equal_results_except_deprecation_warning() {
+    let r = Repo::new();
+    r.stale("safe", false);
+    for args in [
+        vec!["-d", "3", "--dry-run"],
+        vec!["-d", "3"],
+        vec!["-d", "0", "--execute"],
+        vec!["-d", "3", "--execute", "--dry-run"],
+        vec!["--help"],
+    ] {
+        let old = cli(&r, &[&["wt-prune"][..], &args].concat());
+        let new = cli(&r, &[&["wt", "prune"][..], &args].concat());
+        assert_eq!(old.status.code(), new.status.code());
+        assert_eq!(old.stdout, new.stdout);
+        assert_eq!(old.stderr, [WARNING.as_bytes(), &new.stderr].concat());
+        assert!(r.exists("safe"));
+    }
+    // Failure retains every registration for either spelling.
+    r.stale("unique", true);
+    let old = cli(&r, &["wt-prune", "-d", "3", "--execute"]);
+    let new = r.run(&["-d", "3", "--execute"]);
+    assert_eq!(old.status.code(), new.status.code());
+    assert_eq!(old.stdout, new.stdout);
+    assert_eq!(old.stderr, [WARNING.as_bytes(), &new.stderr].concat());
+    assert!(r.exists("safe") && r.exists("unique"));
+}
+
+#[test]
+fn alias_execute_still_only_removes_registration() {
+    let r = Repo::new();
+    r.stale("safe", false);
+    r.git(&["branch", "keep"]);
+    let old = cli(&r, &["wt-prune", "-d", "3", "--execute"]);
+    assert!(old.status.success());
+    assert_eq!(old.stderr, WARNING.as_bytes());
+    assert!(!r.exists("safe"));
+    r.git(&["rev-parse", "--verify", "keep"]);
+    r.stale("safe", false);
+    let new = r.run(&["-d", "3", "--execute"]);
+    assert_eq!(old.status.code(), new.status.code());
+    assert_eq!(old.stdout, new.stdout);
+    assert!(new.stderr.is_empty());
+    assert!(!r.exists("safe"));
+    r.git(&["rev-parse", "--verify", "keep"]);
+}
+
+#[test]
+fn config_does_not_supply_prune_age_and_audit_keeps_command_identity() {
+    let r = Repo::new();
+    r.stale("safe", false);
+    // A flag-shaped path must stay a path, not be treated as a command or flag.
+    fs::write(r.0.join("wt-prune"), "wt-days=3\n").unwrap();
+    for prefix in [
+        vec!["--config", "wt-prune", "--audit-log", "log-a"],
+        vec!["--audit-log", "log-b", "--config", "wt-prune"],
+    ] {
+        let args = [&prefix[..], &["wt", "prune", "--execute"]].concat();
+        let out = cli(&r, &args);
+        assert!(!out.status.success());
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("deprecated"));
+        assert!(r.exists("safe"));
+    }
+    for name in ["log-a", "log-b"] {
+        let text = fs::read_to_string(r.0.join(name)).unwrap();
+        assert!(text.contains("\"command\":\"wt-prune\""));
+        assert!(text.contains("\"target_results_available\":false"));
+    }
+    let out = cli(
+        &r,
+        &[
+            "--config",
+            "wt-prune",
+            "--audit-log",
+            "--config",
+            "wt",
+            "prune",
+            "-d",
+            "3",
+            "--dry-run",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stderr.is_empty());
+    assert!(
+        fs::read_to_string(r.0.join("--config"))
+            .unwrap()
+            .contains("\"command\":\"wt-prune\"")
+    );
+    assert!(r.exists("safe"));
+}
+
+#[test]
+fn help_discovers_subcommand_without_changing_other_command_positions() {
+    let r = Repo::new();
+    let help = cli(&r, &["wt", "--help"]);
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("giclean wt prune --help"));
+    assert!(help.stderr.is_empty());
+    for args in [
+        vec!["br", "prune", "--dry-run"],
+        vec!["wt", "-d", "3", "prune", "--dry-run"],
+    ] {
+        let out = cli(&r, &args);
+        assert!(!out.status.success());
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("deprecated"));
+    }
+}
+
+#[test]
+fn batch_still_treats_prune_as_a_root_path_not_a_subcommand() {
+    let r = Repo::new();
+    r.stale("safe", false);
+    fs::create_dir(r.0.join("prune")).unwrap();
+    let out = cli(&r, &["batch", "wt", "prune", "-d", "3", "--execute"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(r.exists("safe"));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("registration"));
+    assert!(out.stderr.is_empty());
 }

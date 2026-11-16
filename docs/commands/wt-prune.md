@@ -1,8 +1,8 @@
-# wt-prune: 消失した worktree の登録だけを整理する
+# wt prune: 消失した worktree の登録だけを整理する
 
 ```sh
-giclean wt-prune -d 3 --dry-run  # 登録の削除候補を確認
-giclean wt-prune -d 3 --execute  # 確認なしで登録を削除
+giclean wt prune -d 3 --dry-run  # 登録の削除候補を確認
+giclean wt prune -d 3 --execute  # 確認なしで登録を削除
 ```
 
 `-d` / `--days` または `-h` / `--hours` で正の待機時間を指定し、`--dry-run` か `--execute` を毎回明示します。待機時間は登録情報の最終更新から数え、PR のマージ日時は使いません。
@@ -29,4 +29,6 @@ Git が `prunable` と判断した登録だけが対象です。**実体のフ�
 
 削除した登録情報のバックアップは作りません。[復旧の限界](../audit-history.md#復旧可能な範囲)を確認してください。
 
-単一リポジトリのテキスト出力のみです。`batch`・JSON 出力・対話選択には対応しません。オプションは `giclean wt-prune --help` で確認できます。
+単一リポジトリのテキスト出力のみです。`batch`・JSON 出力・対話選択には対応しません。オプションは `giclean wt prune --help` で確認できます。
+
+旧名 `giclean wt-prune` も同じ動作をしますが、非推奨警告を標準エラーに表示します。新しい呼び方には `giclean wt prune` を使ってください。
