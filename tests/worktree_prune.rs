@@ -808,3 +808,304 @@ fn codex_thread_metadata_remains_protected() {
     assert!(!r.run(&["-d", "5", "--execute"]).status.success());
     assert!(r.exists("keep"));
 }
+
+#[test]
+fn skip_retained_only_prunes_safe_missing_registrations() {
+    let r = Repo::new();
+    r.stale("safe", false);
+    r.stale("unique", true);
+    r.stale("recent", false);
+    fs::write(r.0.join(".git/worktrees/recent/COMMIT_EDITMSG"), "recent").unwrap();
+    r.git(&["worktree", "add", "--detach", "live"]);
+    r.git(&["worktree", "add", "--detach", "locked"]);
+    r.git(&["worktree", "lock", "locked"]);
+    fs::remove_dir_all(r.0.join("locked")).unwrap();
+    let unique = fs::read(r.0.join(".git/worktrees/unique/HEAD")).unwrap();
+    let preview = r.run(&["-d", "5", "--dry-run", "--skip-retained"]);
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&preview.stdout),
+        "Would prune registration safe\n"
+    );
+    assert!(String::from_utf8_lossy(&preview.stderr).contains("Retained registration unique"));
+    assert!(r.exists("safe"));
+    let out = r.run(&["-d", "5", "--execute", "--skip-retained"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!r.exists("safe"));
+    for name in ["unique", "recent", "live", "locked"] {
+        assert!(r.exists(name), "{name}");
+    }
+    assert_eq!(
+        fs::read(r.0.join(".git/worktrees/unique/HEAD")).unwrap(),
+        unique
+    );
+    assert!(r.0.join("live/.git").exists());
+    assert!(!fs::read_dir(r.0.join(".git")).unwrap().any(|e| {
+        e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("giclean-prune-recovery-")
+    }));
+}
+
+#[test]
+fn selective_mode_prunes_registration_but_keeps_existing_unregistered_directory() {
+    let r = Repo::new();
+    r.stale("safe", false);
+    r.stale("reappeared", false);
+    fs::create_dir(r.0.join("reappeared")).unwrap();
+    fs::write(r.0.join("reappeared/keep"), "real files").unwrap();
+    let out = r.run(&["-d", "5", "--execute", "--skip-retained"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!r.exists("safe"));
+    assert!(!r.exists("reappeared"));
+    assert_eq!(
+        fs::read_to_string(r.0.join("reappeared/keep")).unwrap(),
+        "real files"
+    );
+}
+
+#[test]
+fn selective_structural_error_still_blocks_everything() {
+    let r = Repo::new();
+    r.stale("safe", false);
+    fs::create_dir(r.0.join(".git/worktrees/broken")).unwrap();
+    let out = r.run(&["-d", "5", "--execute", "--skip-retained"]);
+    assert!(!out.status.success());
+    assert!(r.exists("safe") && r.exists("broken"));
+}
+
+#[test]
+fn selective_all_retained_is_successful_noop_and_requires_explicit_age_and_mode() {
+    let r = Repo::new();
+    r.stale("unique", true);
+    let out = r.run(&["-d", "5", "--execute", "--skip-retained"]);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("No stale registrations"));
+    assert!(r.exists("unique"));
+    for args in [
+        vec!["--skip-retained"],
+        vec!["--skip-retained", "--execute"],
+        vec!["--skip-retained", "-d", "5"],
+        vec!["--skip-retained", "--skip-retained", "-d", "5", "--execute"],
+    ] {
+        assert!(!r.run(&args).status.success());
+    }
+}
+
+#[cfg(unix)]
+fn selective_with_change(r: &Repo, list_call: usize, change: &str) -> Output {
+    use std::os::unix::fs::PermissionsExt;
+    let tools = r.0.join("test-tools");
+    fs::create_dir(&tools).unwrap();
+    let real_git = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    assert!(real_git.status.success());
+    let real_git = String::from_utf8(real_git.stdout).unwrap();
+    let wrapper = tools.join("git");
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1" = worktree ] && [ "$2" = list ]; then
+  count=0
+  [ ! -f '{root}/list-count' ] || count=$(cat '{root}/list-count')
+  count=$((count + 1))
+  printf '%s' "$count" > '{root}/list-count'
+  if [ "$count" -eq {list_call} ]; then
+    {change}
+  fi
+fi
+exec '{real_git}' "$@"
+"#,
+        root = r.0.display(),
+        real_git = real_git.trim()
+    );
+    fs::write(&wrapper, script).unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut paths = vec![tools];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let path = PathBuf::from(std::env::join_paths(paths).unwrap());
+    r.run_with_env(
+        &["-d", "5", "--execute", "--skip-retained"],
+        &[("PATH", &path)],
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn selective_recheck_stops_before_isolation_if_worktree_reappears() {
+    let r = Repo::new();
+    r.stale("safe", false);
+    let out = selective_with_change(
+        &r,
+        2,
+        &format!(
+            "mkdir '{0}/safe'; printf keep > '{0}/safe/keep'; printf marker > '{0}/safe/.git'",
+            r.0.display()
+        ),
+    );
+    assert!(!out.status.success());
+    assert!(r.exists("safe"));
+    assert_eq!(fs::read_to_string(r.0.join("safe/keep")).unwrap(), "keep");
+}
+
+#[cfg(unix)]
+#[test]
+fn selective_post_isolation_changes_preserve_recovery_without_rollback() {
+    for change in [
+        "worktree",
+        "registration",
+        "metadata",
+        "refs",
+        "parent",
+        "recovery-parent",
+    ] {
+        let r = Repo::new();
+        r.stale("safe", false);
+        let root = r.0.display();
+        let command = match change {
+            "worktree" => format!(
+                "mkdir '{root}/safe'; printf keep > '{root}/safe/keep'; printf marker > '{root}/safe/.git'"
+            ),
+            "registration" => format!(
+                "mkdir '{root}/.git/worktrees/safe'; printf new > '{root}/.git/worktrees/safe/keep'"
+            ),
+            "metadata" => {
+                format!(
+                    "for d in '{root}/.git'/giclean-prune-recovery-*; do printf new > \"$d/safe/new-metadata\"; done"
+                )
+            }
+            "refs" => format!("cp '{root}/.git/refs/heads/main' '{root}/.git/refs/heads/new-ref'"),
+            "parent" => format!(
+                "mv '{root}/.git/worktrees' '{root}/.git/worktrees-saved'; mkdir '{root}/.git/worktrees'"
+            ),
+            "recovery-parent" => format!(
+                "for d in '{root}/.git'/giclean-prune-recovery-*; do mv \"$d\" \"$d.saved\"; ln -s \"$d.saved\" \"$d\"; done"
+            ),
+            _ => unreachable!(),
+        };
+        let out = selective_with_change(&r, 3, &command);
+        assert!(!out.status.success(), "{change}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("recovery metadata"),
+            "{change}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let recovery = fs::read_dir(r.0.join(".git"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("giclean-prune-recovery-")
+                    && fs::symlink_metadata(p).unwrap().is_dir()
+            })
+            .unwrap();
+        assert!(recovery.join("safe/HEAD").is_file(), "{change}");
+        if change == "worktree" {
+            assert_eq!(fs::read_to_string(r.0.join("safe/keep")).unwrap(), "keep");
+        }
+        if change == "registration" {
+            assert_eq!(
+                fs::read_to_string(r.0.join(".git/worktrees/safe/keep")).unwrap(),
+                "new"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn selective_mode_retains_nonordinary_worktree_paths() {
+    use std::os::unix::fs::symlink;
+    for link in [false, true] {
+        let r = Repo::new();
+        r.stale("safe", false);
+        r.stale("keep", false);
+        let target = r.0.join("ordinary-target");
+        fs::create_dir(&target).unwrap();
+        if link {
+            symlink(&target, r.0.join("keep")).unwrap();
+        } else {
+            fs::write(r.0.join("keep"), "valuable").unwrap();
+        }
+        let out = r.run(&["-d", "5", "--execute", "--skip-retained"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(r.exists("keep"));
+        assert!(!r.exists("safe"));
+        assert!(fs::symlink_metadata(r.0.join("keep")).is_ok());
+        assert!(target.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn selective_late_unregistered_folder_is_never_removed() {
+    let r = Repo::new();
+    r.stale("safe", false);
+    let out = selective_with_change(
+        &r,
+        3,
+        &format!(
+            "mkdir '{0}/safe'; printf keep > '{0}/safe/keep'",
+            r.0.display()
+        ),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!r.exists("safe"));
+    assert_eq!(fs::read_to_string(r.0.join("safe/keep")).unwrap(), "keep");
+}
+
+#[cfg(unix)]
+#[test]
+fn selective_recovery_directory_collision_is_not_overwritten() {
+    let r = Repo::new();
+    r.stale("safe", false);
+    let out = selective_with_change(
+        &r,
+        2,
+        &format!(
+            "printf keep > '{0}/.git/giclean-prune-recovery-'\"$PPID\"'-0'",
+            r.0.display()
+        ),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let collision = fs::read_dir(r.0.join(".git"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("giclean-prune-recovery-")
+        })
+        .unwrap();
+    assert_eq!(fs::read_to_string(collision).unwrap(), "keep");
+    assert!(!r.exists("safe"));
+}
