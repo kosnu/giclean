@@ -57,7 +57,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     env:
-      RUSTUP_TOOLCHAIN: '1.89.0'
+      RUSTUP_TOOLCHAIN: '1.100.0'
       CARGO_BUILD_TARGET: ${{ matrix.target }}
       RELEASE_TAG: ${{ github.ref_name }}
     steps:
@@ -65,7 +65,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install toolchain
-        run: rustup toolchain install 1.89.0 --profile minimal --component rustfmt --component clippy
+        run: rustup toolchain install 1.100.0 --profile minimal --component rustfmt --component clippy
       - name: Check
         run: make check
       - name: Build release binary

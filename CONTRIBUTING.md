@@ -2,12 +2,13 @@
 
 ## 環境
 
-- Rust / Cargo 1.89.0。`rust-toolchain.toml` で固定しています。
+- 開発・CI・配布ビルドは Rust / Cargo 1.100.0。`rust-toolchain.toml` で固定しています。
+- 最低対応 Rust（MSRV）は 1.89 です。ビルド用の固定バージョンとは別に、`Cargo.toml` で宣言しています。
 - Git 2.47 以降。macOS / Linux を対象にしています。
 - 性能チェックには Python 3（標準ライブラリのみ）も使用します。
 - [rustup](https://rustup.rs/) の利用を想定しています。外部クレートの導入は不要です。
 
-`RUSTUP_TOOLCHAIN` や rustup のディレクトリ設定が指定されていると、ツールチェーンファイルより優先されます。使用バージョンは `rustup show active-toolchain` で確認できます。明示する場合は `cargo +1.89.0 test --locked --all-targets` のように指定してください。
+`RUSTUP_TOOLCHAIN` や rustup のディレクトリ設定が指定されていると、ツールチェーンファイルより優先されます。使用バージョンは `rustup show active-toolchain` で確認できます。明示する場合は `cargo +1.100.0 test --locked --all-targets` のように指定してください。
 
 ## 実行とビルド
 
